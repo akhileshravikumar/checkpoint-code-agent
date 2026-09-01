@@ -1,1 +1,11 @@
-/docs
+docs/
+.venv/
+__pycache__/
+*.py[cod]
+.env
+.workspace/
+*.sqlite
+*.sqlite-*
+.pytest_cache/
+.ruff_cache/
+demo/raw/
