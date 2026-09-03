@@ -16,12 +16,20 @@ class ChangePlan(BaseModel):
 
 
 class FileRewrite(BaseModel):
-    """The complete new contents of the target file (ADR-001)."""
+    """The complete new contents of the target file (ADR-001).
+
+    FIELD ORDER IS LOAD-BEARING. Ollama's structured-output mode compiles this
+    schema to a GBNF grammar that emits properties in declaration order, so the
+    last field is the first casualty of hitting `num_predict`. `new_content` is
+    unbounded (a whole file); the two short fields go before it so a truncated
+    response still loses only the big one, and `_check_truncation` can say so
+    plainly instead of surfacing a confusing "commit_message is required".
+    """
 
     path: str = Field(description="Repo-relative path being rewritten.")
-    new_content: str = Field(
-        description="The ENTIRE new file content. Not a diff, not a fragment."
-    )
     commit_message: str = Field(
         description="Conventional-commit message, e.g. 'fix(search): validate empty query'"
+    )
+    new_content: str = Field(
+        description="The ENTIRE new file content. Not a diff, not a fragment."
     )

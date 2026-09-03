@@ -7,36 +7,77 @@ from app.prompts import PLAN_SYSTEM, PLAN_USER
 from app.schemas import ChangePlan
 from app.state import AgentState
 
+# Directories that are never the agent's business, and would otherwise flood
+# the candidate list in any repo with a virtualenv checked out beside the code.
+_SKIP_DIRS = {".git", ".venv", "venv", "env", "__pycache__", "node_modules",
+              ".tox", ".mypy_cache", ".pytest_cache", "build", "dist", ".workspace"}
 
-def _resolve_target(state: AgentState) -> Path:
+
+class PlanError(RuntimeError):
+    """The plan node cannot proceed — reported to the user, not retried."""
+
+
+def _repo_root(state: AgentState) -> Path:
+    raw = state.get("repo_path") or ""
+    if not raw:
+        raise PlanError(
+            "No repo_path in state. Pass --repo when starting a thread."
+        )
+    repo = Path(raw).expanduser().resolve()
+    if not repo.is_dir():
+        raise PlanError(f"repo_path {repo} does not exist or is not a directory.")
+    return repo
+
+
+def _resolve_target(state: AgentState, repo: Path) -> Path:
     """Locate the target file. If a previous plan chose one, reuse it."""
-    repo = Path(state["repo_path"])
-    if (p := state.get("plan")) and p.target_file:
-        return repo / p.target_file
+    if (p := state.get("plan")) and p.get("target_file"):
+        prior = repo / p["target_file"]
+        if not prior.is_file():
+            raise PlanError(
+                f"The previous plan targeted {p['target_file']!r}, which does not "
+                f"exist under {repo}. The thread may have been started against a "
+                f"different repo."
+            )
+        return prior
 
-    # First pass: pick the candidate whose name appears in the task text,
-    # else the only Python file if there is exactly one.
     candidates = [
         f for f in repo.rglob("*.py")
-        if ".git" not in f.parts and "test" not in f.name
+        if not (_SKIP_DIRS & set(f.relative_to(repo).parts))
+        and not f.name.startswith("test_")
+        and not f.name.endswith("_test.py")
     ]
-    task = state["task"].lower()
+    if not candidates:
+        raise PlanError(f"No Python files found under {repo}.")
+
+    task = state.get("task", "").lower()
     for f in candidates:
         if f.name.lower() in task:
             return f
     if len(candidates) == 1:
         return candidates[0]
-    raise ValueError(
-        f"Could not identify a target file. Name one explicitly in the task. "
-        f"Candidates: {[str(c.relative_to(repo)) for c in candidates]}"
+    raise PlanError(
+        "Could not identify a target file. Name one explicitly in the task. "
+        f"Candidates: {sorted(str(c.relative_to(repo)) for c in candidates)}"
     )
 
 
 def plan_node(state: AgentState) -> dict:
     s = get_settings()
-    repo = Path(state["repo_path"])
-    target = _resolve_target(state)
-    source = target.read_text(encoding="utf-8")
+
+    if not (state.get("task") or "").strip():
+        # Nearly always means a thread was restarted with an empty task instead
+        # of resumed. Planning against "" yields a no-op rewrite and an
+        # "Empty diff" three nodes later, which is a miserable thing to debug.
+        return {"error": "Empty task. To continue an existing thread use "
+                         "`python -m app.cli resume --thread <id>`."}
+
+    try:
+        repo = _repo_root(state)
+        target = _resolve_target(state, repo)
+        source = target.read_text(encoding="utf-8")
+    except (PlanError, OSError) as exc:
+        return {"error": str(exc)}
 
     line_count = source.count("\n") + 1
     if line_count > s.max_file_lines:
@@ -49,7 +90,9 @@ def plan_node(state: AgentState) -> dict:
     if log := state.get("ci_failure_log"):
         extra += f"\nThe previous change failed CI. Failing output:\n```\n{log[-2000:]}\n```\n"
 
-    llm = get_llm(num_predict=512).with_structured_output(ChangePlan, method="json_schema")
+    llm = get_llm(num_predict=s.ollama_num_predict).with_structured_output(
+        ChangePlan, method="json_schema"
+    )
     plan: ChangePlan = llm.invoke([
         ("system", PLAN_SYSTEM),
         ("user", PLAN_USER.format(
@@ -60,4 +103,5 @@ def plan_node(state: AgentState) -> dict:
         )),
     ])
     plan.target_file = str(target.relative_to(repo))  # trust our resolution, not the model's
-    return {"plan": plan, "error": ""}
+    # Stored as a dict, not a Pydantic object: see app/state.py.
+    return {"plan": plan.model_dump(), "repo_path": str(repo), "error": ""}

@@ -12,8 +12,19 @@ class Settings(BaseSettings):
     # Local inference
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen2.5-coder:3b"
-    ollama_num_ctx: int = 8192
+
+    # A full-file rewrite (ADR-001) carries the target file TWICE through the
+    # context: once as source in the prompt, once as `new_content` in the reply.
+    # At MAX_FILE_LINES=200 that is ~4.4k tokens each way, so 8192 overflows and
+    # Ollama silently drops the head of the prompt — including the system message.
+    ollama_num_ctx: int = 16384
+    # Generation budget for short, bounded replies (the plan node).
     ollama_num_predict: int = 1536
+    # Generation budget for a whole-file rewrite. JSON escaping inflates the
+    # payload ~8%, so a 200-line file needs ~5.4k tokens. 1536 truncated every
+    # rewrite past ~130 lines mid-string, which surfaced as an
+    # OutputParserException about the field that happens to serialise last.
+    ollama_num_predict_rewrite: int = 6144
     ollama_temperature: float = 0.1
     ollama_num_thread: int = 0
 
