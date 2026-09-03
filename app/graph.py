@@ -24,7 +24,7 @@ def await_approval_node(state: AgentState) -> dict:
     decision = interrupt({
         "type": "diff_proposed",
         "diff": state["diff"],
-        "plan": state["plan"].model_dump(),
+        "plan": state["plan"],          # already a dict — see app/state.py
         "commit_message": state["commit_message"],
         "stats": diff_stats(state["diff"]),
         "retry_count": state.get("retry_count", 0),

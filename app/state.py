@@ -1,7 +1,11 @@
-"""The graph's state. Persisted by the SQLite checkpointer at every node boundary."""
-from typing import Annotated, Literal, TypedDict
+"""The graph's state. Persisted by the SQLite checkpointer at every node boundary.
 
-from app.schemas import ChangePlan
+Everything in here must survive a msgpack round-trip through the checkpointer.
+Pydantic models do not: LangGraph warns on deserialising an unregistered type and
+will refuse outright in a future release. So `plan` is stored as a plain dict
+(`ChangePlan.model_dump()`) and re-validated at the point of use.
+"""
+from typing import Annotated, Any, Literal, TypedDict
 
 
 def _keep_last(_old, new):
@@ -12,7 +16,10 @@ class AgentState(TypedDict, total=False):
     task: str
     repo_path: str
 
-    plan: ChangePlan | None
+    # ChangePlan.model_dump() — see module docstring. Re-validate with
+    # ChangePlan.model_validate(state["plan"]) before touching its fields.
+    plan: dict[str, Any] | None
+
     diff: str
     new_content: str
     commit_message: str
