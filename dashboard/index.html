@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Checkpoint</title>
+<style>
+  :root { color-scheme: dark; --bg:#0d1117; --panel:#161b22; --line:#30363d;
+          --fg:#e6edf3; --dim:#8b949e; --add:#2ea043; --del:#f85149; --acc:#58a6ff; }
+  * { box-sizing:border-box }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace; }
+  header { padding:14px 20px; border-bottom:1px solid var(--line);
+           display:flex; gap:14px; align-items:center; }
+  h1 { font-size:15px; margin:0; letter-spacing:.02em }
+  .pill { font-size:11px; color:var(--dim); border:1px solid var(--line);
+          padding:2px 8px; border-radius:999px }
+  main { max-width:1000px; margin:0 auto; padding:20px }
+  .row { display:flex; gap:8px; margin-bottom:20px }
+  input { flex:1; background:var(--panel); border:1px solid var(--line);
+          color:var(--fg); padding:10px 12px; border-radius:6px; font:inherit }
+  button { background:var(--panel); border:1px solid var(--line); color:var(--fg);
+           padding:10px 16px; border-radius:6px; cursor:pointer; font:inherit }
+  button:hover:not(:disabled) { border-color:var(--acc) }
+  button:disabled { opacity:.4; cursor:not-allowed }
+  #approve { border-color:var(--add) } #reject { border-color:var(--del) }
+  .card { background:var(--panel); border:1px solid var(--line);
+          border-radius:6px; padding:14px; margin-bottom:14px }
+  .card h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em;
+             color:var(--dim); margin:0 0 10px }
+  pre { margin:0; overflow-x:auto; font-size:12.5px; line-height:1.5 }
+  .diff span { display:block; padding:0 6px }
+  .diff .a { background:rgba(46,160,67,.15); color:#7ee787 }
+  .diff .d { background:rgba(248,81,73,.15); color:#ffa198 }
+  .diff .h { color:var(--acc) }
+  .log div { padding:3px 0; color:var(--dim) }
+  #gate { display:none; gap:8px } #gate.on { display:flex }
+</style>
+</head>
+<body>
+<header>
+  <h1>Checkpoint</h1>
+  <span class="pill" id="thread">connecting…</span>
+  <span class="pill" id="state">idle</span>
+</header>
+<main>
+  <div class="row">
+    <input id="task" placeholder="add input validation to search.py" autofocus>
+    <button id="go">Run</button>
+  </div>
+  <div class="card"><h2>Activity</h2><div class="log" id="log"></div></div>
+  <div class="card" id="plan-card" hidden><h2>Plan</h2><div id="plan"></div></div>
+  <div class="card" id="diff-card" hidden>
+    <h2>Proposed diff <span id="stats"></span></h2>
+    <pre class="diff" id="diff"></pre>
+    <div class="row" id="gate" style="margin-top:14px">
+      <button id="approve">Approve</button>
+      <button id="reject">Reject</button>
+      <input id="note" placeholder="edit request…">
+      <button id="edit">Request edit</button>
+    </div>
+  </div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const ws = new WebSocket(`ws://${location.host}/ws`);
+const log = m => { const d = document.createElement('div');
+                   d.textContent = `${new Date().toLocaleTimeString()}  ${m}`;
+                   $('log').prepend(d); };
+
+const renderDiff = text => {
+  $('diff').innerHTML = '';
+  for (const line of text.split('\n')) {
+    const el = document.createElement('span');
+    el.textContent = line;
+    if (line.startsWith('+') && !line.startsWith('+++')) el.className = 'a';
+    else if (line.startsWith('-') && !line.startsWith('---')) el.className = 'd';
+    else if (line.startsWith('@@')) el.className = 'h';
+    $('diff').appendChild(el);
+  }
+};
+
+ws.onopen = () => log('connected');
+ws.onclose = () => { $('state').textContent = 'disconnected'; log('connection closed'); };
+
+ws.onmessage = e => {
+  const m = JSON.parse(e.data);
+  switch (m.type) {
+    case 'session':
+      $('thread').textContent = m.thread_id; break;
+    case 'status':
+      $('state').textContent = m.message; log(m.message); break;
+    case 'diff_proposed':
+      $('state').textContent = 'awaiting approval';
+      $('plan-card').hidden = false;
+      $('plan').innerHTML = `<b>${m.plan.summary}</b><ol>` +
+        m.plan.steps.map(s => `<li>${s}</li>`).join('') + '</ol>';
+      $('diff-card').hidden = false;
+      $('stats').textContent = `+${m.stats.additions} −${m.stats.deletions}`;
+      renderDiff(m.diff);
+      $('gate').classList.add('on');
+      log('diff proposed — waiting for you');
+      break;
+    case 'execution_result':
+      $('state').textContent = m.approval_status;
+      $('gate').classList.remove('on');
+      log(`finished: ${m.approval_status}` + (m.pr_url ? ` → ${m.pr_url}` : ''));
+      break;
+    case 'error':
+      $('state').textContent = 'error'; log(`ERROR: ${m.message}`); break;
+  }
+};
+
+$('go').onclick = () => {
+  ws.send(JSON.stringify({ type: 'start', task: $('task').value }));
+  $('state').textContent = 'planning…';
+};
+const decide = (decision, note = '') => {
+  ws.send(JSON.stringify({ type: 'approval', decision, note }));
+  $('gate').classList.remove('on');
+};
+$('approve').onclick = () => decide('approved');
+$('reject').onclick  = () => decide('rejected');
+$('edit').onclick    = () => decide('edit_requested', $('note').value);
+</script>
+</body>
+</html>
