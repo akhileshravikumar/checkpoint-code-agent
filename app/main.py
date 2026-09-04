@@ -12,6 +12,7 @@ from app.config import get_settings
 from app.events import bus
 from app.graph import build_graph, make_checkpointer
 from app.tracing import configure_tracing
+from app.state import new_task
 
 DASHBOARD = Path(__file__).parent.parent / "dashboard" / "index.html"
 
@@ -92,11 +93,7 @@ async def ws(websocket: WebSocket):
                     })
                     continue
                 bus.publish(thread_id, {"type": "status", "message": "planning..."})
-                payload = {
-                    "task": msg["task"],
-                    "repo_path": msg.get("repo_path", "./.workspace"),
-                    "retry_count": 0,
-                }
+                payload = new_task(msg["task"], msg.get("repo_path", "./.workspace"))
                 asyncio.create_task(asyncio.to_thread(
                     _run_until_pause, graph, payload, config, thread_id
                 ))

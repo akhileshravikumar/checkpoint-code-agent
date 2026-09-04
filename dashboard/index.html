@@ -62,7 +62,11 @@
 </main>
 <script>
 const $ = id => document.getElementById(id);
-const ws = new WebSocket(`ws://${location.host}/ws`);
+const KEY = 'checkpoint_thread';
+const prior = new URLSearchParams(location.search).get('thread_id')
+           || localStorage.getItem(KEY) || '';
+const ws = new WebSocket(
+  `ws://${location.host}/ws` + (prior ? `?thread_id=${encodeURIComponent(prior)}` : ''));
 const log = m => { const d = document.createElement('div');
                    d.textContent = `${new Date().toLocaleTimeString()}  ${m}`;
                    $('log').prepend(d); };
@@ -86,7 +90,10 @@ ws.onmessage = e => {
   const m = JSON.parse(e.data);
   switch (m.type) {
     case 'session':
-      $('thread').textContent = m.thread_id; break;
+        $('thread').textContent = m.thread_id;
+        localStorage.setItem(KEY, m.thread_id);
+        history.replaceState(null, '', `?thread_id=${m.thread_id}`);
+        break;
     case 'status':
       $('state').textContent = m.message; log(m.message); break;
     case 'diff_proposed':
@@ -104,6 +111,7 @@ ws.onmessage = e => {
       $('state').textContent = m.approval_status;
       $('gate').classList.remove('on');
       log(`finished: ${m.approval_status}` + (m.pr_url ? ` → ${m.pr_url}` : ''));
+      localStorage.removeItem(KEY);
       break;
     case 'error':
       $('state').textContent = 'error'; log(`ERROR: ${m.message}`); break;
