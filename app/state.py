@@ -35,3 +35,28 @@ class AgentState(TypedDict, total=False):
 
     retry_count: Annotated[int, _keep_last]
     error: str
+
+def new_task(task: str, repo_path: str) -> AgentState:
+    """The input for STARTING a task. Never for resuming one (ADR-005).
+
+    A thread can outlive the task that created it — the dashboard reuses one
+    socket, and `run --thread X` can be pointed at a finished thread. Whatever
+    is not overwritten here survives into the next run, so every task-scoped
+    field is cleared explicitly. Leaving `plan` behind is the expensive one:
+    plan resolves the target from the previous plan when replanning, so a second
+    task would be silently planned against the first task's file no matter which
+    file it named.
+    """
+    return {
+        "task": task,
+        "repo_path": repo_path,
+        "plan": None,
+        "diff": "",
+        "new_content": "",
+        "commit_message": "",
+        "approval_status": "pending",
+        "edit_note": "",
+        "ci_failure_log": "",
+        "retry_count": 0,
+        "error": "",
+    }

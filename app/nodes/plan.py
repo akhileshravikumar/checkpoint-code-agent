@@ -28,10 +28,20 @@ def _repo_root(state: AgentState) -> Path:
         raise PlanError(f"repo_path {repo} does not exist or is not a directory.")
     return repo
 
+def _is_replan(state: AgentState) -> bool:
+    """True when we re-entered plan from the approval gate or a CI failure.
+
+    A replan must stay on the file the reviewer was looking at. A NEW task on
+    the same thread must not: reusing the old target there means the second
+    request is silently planned against the first request's file, however
+    plainly the task names a different one.
+    """
+    return bool(state.get("edit_note") or state.get("ci_failure_log"))
+
 
 def _resolve_target(state: AgentState, repo: Path) -> Path:
-    """Locate the target file. If a previous plan chose one, reuse it."""
-    if (p := state.get("plan")) and p.get("target_file"):
+    """Locate the target file. On a replan, stay on the file already chosen."""
+    if _is_replan(state) and (p := state.get("plan")) and p.get("target_file"):
         prior = repo / p["target_file"]
         if not prior.is_file():
             raise PlanError(
