@@ -7,6 +7,7 @@ from rich.console import Console
 from rich.syntax import Syntax
 
 from app.graph import build_graph, make_checkpointer
+from app.state import new_task
 from app.tracing import configure_tracing
 
 cli = typer.Typer()
@@ -26,7 +27,7 @@ def _show(payload: dict) -> None:
 def _ask() -> dict:
     while True:
         choice = typer.prompt("approve / reject / edit").strip().lower()
-        if choice[:1] in "are":
+        if choice[:1] and choice[0] in "are":
             break
         console.print("[yellow]Answer approve, reject or edit.[/yellow]")
     decision = {"a": "approved", "r": "rejected", "e": "edit_requested"}[choice[0]]
@@ -72,9 +73,7 @@ def run(task: str, repo: str = ".", thread: str = ""):
         raise typer.Exit(1)
 
     console.print(f"[dim]thread_id: {thread_id}[/dim]")
-    result = graph.invoke(
-        {"task": task, "repo_path": repo, "retry_count": 0}, config=config
-    )
+    result = graph.invoke(new_task(task, repo), config=config)
     _report(_drive(graph, config, result))
 
 

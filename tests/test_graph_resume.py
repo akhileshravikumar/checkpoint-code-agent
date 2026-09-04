@@ -200,3 +200,90 @@ def test_venv_is_not_a_candidate(fixture_repo, stub, tmp_path):
     # search.py is the only real candidate, so it resolves without being named.
     assert not out.get("error")
     assert out["__interrupt__"][0].value["plan"]["target_file"] == "search.py"
+
+# --- one thread, two tasks: the second must not inherit the first's target ---
+
+class _RecordingPlan:
+    """Captures the prompt and targets whichever file the task names."""
+
+    def __init__(self, seen):
+        self.seen = seen
+
+    def invoke(self, messages):
+        user = messages[1][1]
+        self.seen.append(user)
+        target = "ranker.py" if "ranker.py" in user else "search.py"
+        return ChangePlan(target_file=target, summary="s",
+                          steps=["do it"], rationale="r")
+
+
+@pytest.fixture
+def two_file_repo(fixture_repo):
+    (fixture_repo / "ranker.py").write_text("def rank(xs):\n    return sorted(xs)\n")
+    subprocess.run(["git", "-C", str(fixture_repo), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(fixture_repo), "-c", "user.email=t@t", "-c", "user.name=t",
+         "commit", "-qm", "add ranker"], check=True,
+    )
+    return fixture_repo
+
+
+@pytest.fixture
+def recording(monkeypatch, two_file_repo):
+    seen = []
+
+    class _Append:
+        def invoke(self, _messages):
+            raw = type("Msg", (), {"response_metadata": {"done_reason": "stop"}})()
+            target = "ranker.py" if "ranker.py" in seen[-1] else "search.py"
+            cur = (two_file_repo / target).read_text()
+            return {"raw": raw,
+                    "parsed": FileRewrite(path=target, commit_message="c",
+                                          new_content=cur.rstrip("\n") + "\n# edit\n"),
+                    "parsing_error": None}
+
+    class _Chain:
+        def __init__(self, which):
+            self.which = which
+
+        def with_structured_output(self, *_a, **_k):
+            return _RecordingPlan(seen) if self.which == "plan" else _Append()
+
+    monkeypatch.setattr(plan_mod, "get_llm", lambda **_k: _Chain("plan"))
+    monkeypatch.setattr(diff_mod, "get_llm", lambda **_k: _Chain("diff"))
+    return seen
+
+
+def _target_of(prompt: str) -> str:
+    return prompt.split("File: ")[1].split("\n")[0]
+
+
+def test_new_task_on_a_finished_thread_retargets(two_file_repo, recording, tmp_path):
+    """The bug: task 2 named ranker.py and was planned against search.py."""
+    cfg = {"configurable": {"thread_id": "reuse"}}
+    graph = _build(tmp_path / "cp.sqlite")
+
+    graph.invoke({"task": "fix search.py", "repo_path": str(two_file_repo),
+                  "retry_count": 0}, config=cfg)
+    graph.invoke(Command(resume={"decision": "approved", "note": ""}), config=cfg)
+    assert _target_of(recording[-1]) == "search.py"
+
+    graph.invoke({"task": "sort the output of ranker.py",
+                  "repo_path": str(two_file_repo), "retry_count": 0}, config=cfg)
+    assert _target_of(recording[-1]) == "ranker.py"
+
+
+def test_a_replan_stays_on_the_reviewed_file(two_file_repo, recording, tmp_path):
+    """The other half: edit_requested must NOT re-resolve the target."""
+    cfg = {"configurable": {"thread_id": "replan"}}
+    graph = _build(tmp_path / "cp.sqlite")
+
+    graph.invoke({"task": "fix search.py", "repo_path": str(two_file_repo),
+                  "retry_count": 0}, config=cfg)
+    assert _target_of(recording[-1]) == "search.py"
+
+    # A note that names the other file must not drag the replan onto it.
+    graph.invoke(Command(resume={"decision": "edit_requested",
+                                 "note": "same idea as in ranker.py please"}),
+                 config=cfg)
+    assert _target_of(recording[-1]) == "search.py"
