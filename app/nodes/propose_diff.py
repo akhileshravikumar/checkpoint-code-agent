@@ -1,36 +1,56 @@
-"""propose_diff node: ChangePlan -> validated unified diff."""
+"""propose_diff node: ChangePlan -> validated unified diff.
+
+ADR-007 — the file body is plain text, not a JSON string. *(amends ADR-001)*
+
+ADR-001 moved diff arithmetic out of the model. It left one thing in that a
+small model is just as bad at: emitting the file as a JSON string value. A
+6-line module with two docstrings needs 12 correctly-escaped quote characters,
+and qwen2.5-coder:3b drops one often enough to fail every run — closing a
+triple-quoted docstring with two quotes instead of three, and producing an
+unterminated string literal that has nothing to do with the code it was asked
+to write. (Writing this docstring hit the same bug: a literal triple quote in
+the prose closed it early.)
+
+So the rewrite is now an ordinary completion whose entire body is the file, and
+`commit_message` is computed in Python from the plan. Nothing the model emits
+has to be escaped, and the one remaining field it could get wrong is gone.
+
+The trade is that the output is unconstrained: it may arrive fenced or wrapped
+in commentary. Both are cheap to strip, and `check_rewrite` rejects anything
+else — which is the same bargain as ADR-001, just moved one layer out.
+"""
 from pathlib import Path
 
-from langchain_core.exceptions import OutputParserException
-
 from app.config import get_settings
-from app.diffing import PatchError, build_unified_diff, validate_patch
+from app.diffing import (
+    PatchError,
+    RewriteError,
+    build_unified_diff,
+    check_rewrite,
+    extract_file_body,
+    validate_patch,
+)
 from app.llm import get_llm
-from app.schemas import ChangePlan, FileRewrite
+from app.schemas import ChangePlan
 from app.state import AgentState
 
 DIFF_SYSTEM = """You rewrite a single Python file to implement an approved plan.
 
-Return a structured FileRewrite object with ALL required fields:
-
-* `path`: the relative path of the file being modified.
-* `commit_message`: a short imperative git commit message describing the change.
-* `new_content`: the COMPLETE new file content. Not a diff. Not a snippet.
-  Not an explanation. The entire file, top to bottom, ready to save to disk.
+Your ENTIRE response is written to disk as the file, byte for byte. Output the
+file content and nothing else.
 
 Rules:
 
-* The file MUST differ from the current content. Returning it unchanged is a
-  failure, not a valid answer.
-* Preserve every part of the file the plan does not mention: imports, docstrings,
-  unrelated functions, blank lines, comments.
-* Keep the existing indentation style exactly.
-* Make the smallest change necessary to implement the plan.
-* Do not add example usage or demonstration code unless explicitly requested.
-* Do not add unnecessary comments.
-* Do not repeat code.
-* Do not wrap content in markdown code fences.
-* Do not add commentary outside the structured response."""
+* No markdown fences. No explanation before or after. No commentary.
+* Output the WHOLE file, first line to last, including every import, docstring,
+  function and class that is already there.
+* Preserve every part the plan does not mention.
+* Copy strings and docstrings EXACTLY as they appear, including the quoting
+  style. Do not rewrap or re-quote them.
+* Keep the existing indentation style.
+* Make the smallest change that satisfies the plan.
+* The file MUST differ from the current content — returning it unchanged is a
+  failure, not a valid answer."""
 
 DIFF_USER = """Plan: {summary}
 
@@ -39,62 +59,70 @@ Steps:
 
 Target file: {path}
 
-Current content:
-
-```python
+Current content ({line_count} lines):
+---BEGIN FILE---
 {source}
-```
+---END FILE---
 
-Rewrite the file according to the plan.
+Rewrite the file according to the plan. Your answer must be about {line_count}
+lines — the whole file, with only the planned change applied.
 
-Requirements:
-
-* Set `path` to exactly `{path}`.
-* Provide a concise imperative `commit_message`.
-* Return the complete replacement content in `new_content`.
-* Preserve unrelated code.
-* Make only the changes required by the plan."""
+Output the complete file now, starting with its first line:"""
 
 
 class TruncatedError(RuntimeError):
-    """Generation hit num_predict before the model closed the JSON object."""
+    """Generation hit num_predict before the model finished the file."""
 
 
-# What to tell the model on the second attempt. Generic "return all required
-# fields" feedback is useless when the response was structurally valid but
-# semantically a no-op — the model just repeats itself.
+# What to tell the model on the second attempt. Generic "try again" feedback is
+# useless when the response was structurally fine but semantically a no-op.
 _RETRY_HINTS = {
     "empty": (
-        "Your previous `new_content` was byte-identical to the current file. "
-        "You did not apply the plan. Re-read the steps and produce a file that "
-        "actually differs — the specific lines the plan describes must change."
+        "Your previous answer was byte-identical to the current file. You did "
+        "not apply the plan. Re-read the steps and produce a file that actually "
+        "differs — the specific lines the plan describes must change."
     ),
-    "path": (
-        "Your previous response rewrote the wrong file. Set `path` to exactly "
-        "the target path given above and rewrite THAT file."
+    "dropped": (
+        "Your previous answer was NOT the complete file — it replaced the module "
+        "instead of editing it. Copy the current content line for line, apply "
+        "ONLY the planned change, and return the whole thing. Every function, "
+        "class, import and docstring that exists now must still exist."
+    ),
+    "syntax": (
+        "Your previous answer was not valid Python. Copy every string and "
+        "docstring from the current content EXACTLY, character for character, "
+        "including the quoting style. A docstring opened with three double "
+        "quotes must be closed with three double quotes."
     ),
     "apply": (
-        "Your previous `new_content` produced a patch git could not apply. This "
+        "Your previous answer produced a patch git could not apply, which "
         "usually means content was dropped. Return the ENTIRE file — every line "
         "from the first to the last, including parts the plan does not touch."
-    ),
-    "parse": (
-        "Your previous response was not valid structured output. Return a "
-        "FileRewrite object with exactly the fields path, commit_message and "
-        "new_content, and nothing else."
     ),
 }
 
 
 def _classify(exc: Exception) -> str:
-    if isinstance(exc, OutputParserException):
-        return "parse"
-    msg = str(exc)
-    if "Empty diff" in msg:
+    if isinstance(exc, RewriteError):
+        # "you deleted the module" and "you broke the quoting" need different
+        # advice; the same hint for both sends the model chasing the wrong fix.
+        return "syntax" if "not valid Python" in str(exc) else "dropped"
+    if "Empty diff" in str(exc):
         return "empty"
-    if msg.startswith("Expected path"):
-        return "path"
     return "apply"
+
+
+def _commit_message(plan: ChangePlan) -> str:
+    """Derive the commit message rather than asking for it.
+
+    It was the last structured field, and the model has nothing to add that the
+    plan does not already contain. One fewer thing to get wrong.
+    """
+    scope = Path(plan.target_file).stem
+    summary = plan.summary.strip().rstrip(".")
+    if summary:
+        summary = summary[0].lower() + summary[1:]
+    return f"fix({scope}): {summary or 'apply planned change'}"[:72]
 
 
 def propose_diff_node(state: AgentState) -> dict:
@@ -115,6 +143,7 @@ def propose_diff_node(state: AgentState) -> dict:
                 ),
                 path=plan.target_file,
                 source=before,
+                line_count=before.strip().count(chr(10)) + 1,
             ),
         ),
     ]
@@ -122,16 +151,12 @@ def propose_diff_node(state: AgentState) -> dict:
     last_error = ""
     kind = ""
 
-    for attempt in range(2):
+    for attempt in range(2):  # one bounded retry (ADR-001)
         # A second pass at temperature 0.1 against an unchanged prompt
         # re-samples almost the same tokens. Nudge it off the previous mode.
         llm = get_llm(
             num_predict=s.ollama_num_predict_rewrite,
             temperature=s.ollama_temperature if attempt == 0 else 0.4,
-        ).with_structured_output(
-            FileRewrite,
-            method="json_schema",
-            include_raw=True,   # need response_metadata to spot truncation
         )
 
         messages = list(prompt)
@@ -139,57 +164,40 @@ def propose_diff_node(state: AgentState) -> dict:
             messages.append(("user", _RETRY_HINTS[kind] + f"\n\n(Error: {last_error})"))
 
         try:
-            raw = llm.invoke(messages)
+            resp = llm.invoke(messages)
 
-            if err := raw.get("parsing_error"):
-                # Distinguish "ran out of tokens" from "emitted nonsense".
-                meta = getattr(raw.get("raw"), "response_metadata", {}) or {}
-                if meta.get("done_reason") == "length":
-                    raise TruncatedError(
-                        f"Generation hit num_predict="
-                        f"{s.ollama_num_predict_rewrite} before finishing the "
-                        f"file. Raise OLLAMA_NUM_PREDICT_REWRITE or lower "
-                        f"MAX_FILE_LINES (file is "
-                        f"{before.count(chr(10)) + 1} lines)."
-                    )
-                raise err
-
-            result: FileRewrite = raw["parsed"]
-
-            # Guard against the model changing a different file.
-            if result.path != plan.target_file:
-                raise PatchError(
-                    f"Expected path {plan.target_file!r}, "
-                    f"got {result.path!r}"
+            meta = getattr(resp, "response_metadata", {}) or {}
+            if meta.get("done_reason") == "length":
+                raise TruncatedError(
+                    f"Generation hit num_predict={s.ollama_num_predict_rewrite} "
+                    f"before finishing the file. Raise "
+                    f"OLLAMA_NUM_PREDICT_REWRITE or lower MAX_FILE_LINES "
+                    f"(file is {before.count(chr(10)) + 1} lines)."
                 )
 
-            diff = build_unified_diff(
-                plan.target_file,
-                before,
-                result.new_content,
-            )
+            new_content = extract_file_body(resp.content)
 
+            # Semantic check first: a patch that deletes the file applies
+            # perfectly cleanly, so git cannot be the one to catch this.
+            check_rewrite(plan.target_file, before, new_content)
+
+            diff = build_unified_diff(plan.target_file, before, new_content)
             validate_patch(repo, diff)
 
         except TruncatedError as exc:
             # Not the model's fault and not fixable by re-prompting it.
             return {"error": str(exc)}
-        except (PatchError, OutputParserException) as exc:
+        except PatchError as exc:
             last_error = str(exc)
             kind = _classify(exc)
             continue
 
         return {
             "diff": diff,
-            "new_content": result.new_content,
-            "commit_message": result.commit_message,
+            "new_content": new_content,
+            "commit_message": _commit_message(plan),
             "approval_status": "pending",
             "error": "",
         }
 
-    return {
-        "error": (
-            "Could not produce a valid patch after "
-            f"2 attempts: {last_error}"
-        )
-    }
+    return {"error": f"Could not produce a valid patch after 2 attempts: {last_error}"}
