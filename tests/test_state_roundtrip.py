@@ -3,10 +3,9 @@ import sqlite3
 import warnings
 from pathlib import Path
 
-import pytest
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import Command, interrupt
+from langgraph.types import interrupt
 
 from app.schemas import ChangePlan
 from app.state import AgentState

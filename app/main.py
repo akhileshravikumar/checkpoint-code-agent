@@ -10,6 +10,7 @@ from langgraph.types import Command
 
 from app.config import get_settings
 from app.events import bus
+from app.github_client import GitHubClient, _redact
 from app.graph import build_graph, make_checkpointer
 from app.tracing import configure_tracing
 from app.state import new_task
@@ -21,6 +22,17 @@ DASHBOARD = Path(__file__).parent.parent / "dashboard" / "index.html"
 async def lifespan(app: FastAPI):
     configure_tracing()
     app.state.graph = build_graph(make_checkpointer())
+    s = get_settings()
+    app.state.workspace = str(s.workspace_dir.expanduser().resolve())
+    if not s.checkpoint_offline:
+        try:
+            gh = GitHubClient()
+            try:
+                app.state.workspace = str(await asyncio.to_thread(gh.ensure_workspace))
+            finally:
+                gh.close()
+        except Exception as exc:
+            print(f"[startup] workspace not refreshed: {_redact(str(exc), s.github_token)}")
     yield
 
 
@@ -36,6 +48,16 @@ async def index():
 async def health():
     return {"ok": True, "model": get_settings().ollama_model}
 
+def _refresh_workspace() -> str:
+    """Pull origin/main into the workspace before planning against it."""
+    s = get_settings()
+    if s.checkpoint_offline:
+        return str(s.workspace_dir.expanduser().resolve())
+    gh = GitHubClient()
+    try:
+        return str(gh.ensure_workspace())
+    finally:
+        gh.close()
 
 def _run_until_pause(graph, payload, config, thread_id: str) -> None:
     """Run the graph in a worker thread; publish whatever it stops on.
@@ -92,8 +114,11 @@ async def ws(websocket: WebSocket):
                                    "Decide on the current diff, or open a new session.",
                     })
                     continue
+                bus.publish(thread_id, {"type": "status", "message": "refreshing workspace..."})
+                workspace = await asyncio.to_thread(_refresh_workspace)
                 bus.publish(thread_id, {"type": "status", "message": "planning..."})
-                payload = new_task(msg["task"], msg.get("repo_path", "./.workspace"))
+                payload = new_task(msg["task"], msg.get("repo_path") or workspace)
+                
                 asyncio.create_task(asyncio.to_thread(
                     _run_until_pause, graph, payload, config, thread_id
                 ))

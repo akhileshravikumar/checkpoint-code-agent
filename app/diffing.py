@@ -13,7 +13,9 @@ newline — a patch that passed difflib and then failed git. Only the model's
 """
 from __future__ import annotations
 
+import ast
 import difflib
+import re
 import subprocess
 from pathlib import Path
 
@@ -85,6 +87,121 @@ def build_unified_diff(rel_path: str, before: str, after: str, context: int = 3)
     ))
 
 
+_FENCE = re.compile(r"^```[A-Za-z0-9_+-]*$")
+
+
+def strip_code_fences(text: str) -> str:
+    """Remove markdown fences a model wrapped around the file body.
+
+    The prompt says not to, and a bigger model wouldn't. A 3B one does it often
+    enough that treating it as a formatting artefact — like line endings — beats
+    spending a retry on it.
+    """
+    lines = text.strip("\n").split("\n")
+    if lines and _FENCE.match(lines[0].strip()):
+        lines = lines[1:]
+        while lines and not lines[-1].strip():
+            lines.pop()
+        if lines and lines[-1].strip().startswith("```"):
+            lines.pop()
+    elif lines and lines[-1].strip().startswith("```"):
+        lines.pop()
+    return "\n".join(lines) + "\n"
+
+
+_FENCE_BLOCK = re.compile(r"```[A-Za-z0-9_+-]*\n(.*?)```", re.S)
+
+
+def extract_file_body(text: str) -> str:
+    """Pull the file out of a plain-text completion.
+
+    ADR-007 asks the model for the file body as prose, not as a JSON string, so
+    there is no escaping to get wrong. The cost is that the model may wrap it in
+    fences or bracket it with commentary; both are cheap to strip here, and
+    anything else check_rewrite rejects.
+    """
+    blocks = _FENCE_BLOCK.findall(text)
+    if blocks:
+        return max(blocks, key=len).strip("\n") + "\n"
+    return strip_code_fences(text)
+
+
+def _excerpt(source: str, lineno: int | None, radius: int = 3) -> str:
+    """The neighbourhood of a syntax error, numbered, for the error message."""
+    lines = source.split("\n")
+    if lineno is None:
+        lineno = len(lines)
+    lo, hi = max(0, lineno - 1 - radius), min(len(lines), lineno + radius)
+    out = []
+    for i in range(lo, hi):
+        mark = ">>" if i == lineno - 1 else "  "
+        out.append(f"{mark} {i + 1:3d} | {lines[i]}")
+    return "\n".join(out)
+
+
+class RewriteError(PatchError):
+    """The "complete file" the model returned plainly is not the complete file."""
+
+
+def _toplevel_symbols(source: str) -> set[str]:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    return {
+        n.name for n in tree.body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+
+
+def check_rewrite(rel_path: str, before: str, after: str, min_ratio: float = 0.5) -> None:
+    """Reject a rewrite that dropped the file instead of editing it.
+
+    ADR-001 has the model return the whole file and lets Python compute the
+    diff, which makes a malformed *patch* impossible. It does nothing about a
+    well-formed patch that deletes the program: replacing a 6-line module with
+    `import re` applies perfectly cleanly, and neither `git apply --check` nor
+    the empty-diff guard has any opinion about it.
+
+    So this is the semantic half of validation. Deterministic, not a prompt —
+    same reasoning as ADR-001. Runs before the diff is built, so the retry hint
+    can tell the model exactly what it destroyed.
+    """
+    if not after.strip():
+        raise RewriteError("new_content was empty.")
+
+    if rel_path.endswith(".py"):
+        try:
+            ast.parse(after)
+        except SyntaxError as exc:
+            # Catching this here turns a CI round-trip into an instant retry.
+            # The excerpt is what makes the failure debuggable from the
+            # dashboard error card, instead of just a line number.
+            # repr() of the head survives copy-paste into a chat or an issue,
+            # where the excerpt's quotes and whitespace do not.
+            raise RewriteError(
+                f"new_content is not valid Python: line {exc.lineno}: {exc.msg}\n"
+                f"{_excerpt(after, exc.lineno)}\n"
+                f"raw head: {after[:160]!r}"
+            ) from None
+
+        lost = _toplevel_symbols(before) - _toplevel_symbols(after)
+        if lost:
+            raise RewriteError(
+                "new_content is missing top-level definitions that were in the "
+                f"original file: {', '.join(sorted(lost))}. The rewrite must "
+                "contain the ENTIRE file."
+            )
+
+    n_before = len(before.strip().splitlines())
+    n_after = len(after.strip().splitlines())
+    if n_before and n_after < n_before * min_ratio:
+        raise RewriteError(
+            f"new_content is {n_after} lines but the original file is "
+            f"{n_before}. Content was dropped rather than edited."
+        )
+
+
 def _git(repo: Path, *args: str, stdin: str | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["git", "-C", str(repo), *args],
@@ -109,6 +226,6 @@ def apply_patch(repo: Path, diff: str) -> None:
 
 
 def diff_stats(diff: str) -> dict[str, int]:
-    add = sum(1 for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++"))
-    rem = sum(1 for l in diff.splitlines() if l.startswith("-") and not l.startswith("---"))
+    add = sum(1 for ln in diff.splitlines() if ln.startswith("+") and not ln.startswith("+++"))
+    rem = sum(1 for ln in diff.splitlines() if ln.startswith("-") and not ln.startswith("---"))
     return {"additions": add, "deletions": rem}
