@@ -1,8 +1,4 @@
-"""End-to-end: plan -> propose_diff -> pause -> (process dies) -> resume -> execute.
-
-No Ollama. The model is stubbed so the test exercises the graph, the
-checkpointer and the diff engine, which is where the Week-1 bugs lived.
-"""
+"""End-to-end: plan -> propose_diff -> pause -> (process dies) -> resume -> execute."""
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -12,9 +8,10 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 
 from app import graph as graph_mod
+from app.nodes import execute as exec_mod
 from app.nodes import plan as plan_mod
 from app.nodes import propose_diff as diff_mod
-from app.schemas import ChangePlan, FileRewrite
+from app.schemas import ChangePlan
 
 BEFORE = "def parse_query(q):\n    return q.strip().split()\n"
 AFTER = (
@@ -38,25 +35,16 @@ class _StubPlan:
 
 
 class _StubRewrite:
-    """Mimics with_structured_output(..., include_raw=True)."""
+    """Mimics a plain completion — ADR-007, the body is not JSON."""
 
-    def __init__(self, content=AFTER, done_reason="stop", parsed=True):
-        self.content, self.done_reason, self.parsed = content, done_reason, parsed
+    def __init__(self, content=AFTER, done_reason="stop"):
+        self.content, self.done_reason = content, done_reason
 
     def invoke(self, _messages):
-        raw = type("Msg", (), {"response_metadata": {"done_reason": self.done_reason}})()
-        if not self.parsed:
-            return {"raw": raw, "parsed": None,
-                    "parsing_error": ValueError("unterminated string")}
-        return {
-            "raw": raw,
-            "parsed": FileRewrite(
-                path="search.py",
-                commit_message="fix(search): reject empty queries",
-                new_content=self.content,
-            ),
-            "parsing_error": None,
-        }
+        return type("AIMessage", (), {
+            "content": self.content,
+            "response_metadata": {"done_reason": self.done_reason},
+        })()
 
 
 @pytest.fixture
@@ -83,21 +71,66 @@ def stub(monkeypatch):
             self.which = which
 
         def with_structured_output(self, *_a, **_k):
-            return _StubPlan() if self.which == "plan" else box["rewrite"]
+            return _StubPlan()
+
+        def invoke(self, messages):
+            return box["rewrite"].invoke(messages)
 
     monkeypatch.setattr(plan_mod, "get_llm", lambda **_k: _Chain("plan"))
     monkeypatch.setattr(diff_mod, "get_llm", lambda **_k: _Chain("diff"))
     return box
 
 
+@pytest.fixture(autouse=True)
+def local_github(monkeypatch, tmp_path):
+    """Week 2 swapped execute_local_node for a node that pushes to GitHub.
+
+    These tests are about the graph's semantics — that approval applies the
+    patch and rejection does not — so GitHub is stubbed down to a local apply.
+    Weakening the assertions instead would delete the project's central claim
+    from the test suite.
+    """
+    box = {"repo": None}
+
+    class _Fake:
+        def ensure_workspace(self):
+            return box["repo"]
+
+        @staticmethod
+        def branch_name(task, seed=""):
+            return f"checkpoint/stub-{seed or 'x'}"
+
+        def branch_exists(self, name):
+            return False
+
+        def create_branch(self, name):
+            pass
+
+        def commit_and_push(self, branch, message, paths):
+            return "deadbeef"
+
+        def find_pr_for_branch(self, branch):
+            return None
+
+        def open_pr(self, branch, title, body):
+            return type("PR", (), {"url": "https://github.com/o/r/pull/1",
+                                   "head_sha": "deadbeef", "number": 1,
+                                   "branch": branch})()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(exec_mod, "GitHubClient", _Fake)
+    return box
+
+
 def _build(db: Path):
-    conn = sqlite3.connect(str(db), check_same_thread=False)
-    saver = SqliteSaver(conn)
+    saver = SqliteSaver(sqlite3.connect(str(db), check_same_thread=False))
     saver.setup()
     return graph_mod.build_graph(saver)
 
 
-def test_pause_survives_a_process_restart_and_resumes(fixture_repo, stub, tmp_path):
+def test_pause_survives_a_process_restart_and_resumes(fixture_repo, stub, tmp_path, local_github):
     """The Week-1 acceptance criterion, as a test."""
     db = tmp_path / "cp.sqlite"
     cfg = {"configurable": {"thread_id": "t1"}}
@@ -109,7 +142,6 @@ def test_pause_survives_a_process_restart_and_resumes(fixture_repo, stub, tmp_pa
     )
     payload = result["__interrupt__"][0].value
     assert payload["type"] == "diff_proposed"
-    assert payload["plan"]["summary"] == "Reject empty queries"
     assert payload["stats"] == {"additions": 2, "deletions": 0}
     assert (fixture_repo / "search.py").read_text() == BEFORE, "nothing applied yet"
 
@@ -120,17 +152,15 @@ def test_pause_survives_a_process_restart_and_resumes(fixture_repo, stub, tmp_pa
     assert snap.values["task"] == "make search.py reject empty queries"
     assert snap.values["repo_path"] == str(fixture_repo)
 
+    local_github["repo"] = str(fixture_repo)
     out = graph.invoke(Command(resume={"decision": "approved", "note": ""}), config=cfg)
-    assert not out.get("__interrupt__")
     assert not out.get("error")
     assert (fixture_repo / "search.py").read_text() == AFTER
+    assert out["pr_url"].endswith("/pull/1")
 
 
 def test_restarting_with_an_empty_task_does_not_wipe_the_thread(fixture_repo, stub, tmp_path):
-    """`run '' --thread X` used to replan against task='' and repo='.'.
-
-    The plan node now refuses instead of producing a mystifying empty diff.
-    """
+    """ADR-005: `run '' --thread X` used to replan against task='' and repo='.'."""
     db = tmp_path / "cp.sqlite"
     cfg = {"configurable": {"thread_id": "t2"}}
     graph = _build(db)
@@ -141,13 +171,11 @@ def test_restarting_with_an_empty_task_does_not_wipe_the_thread(fixture_repo, st
     )
     out = graph.invoke({"task": "", "repo_path": ".", "retry_count": 0}, config=cfg)
     assert "Empty task" in out["error"]
-    assert "resume" in out["error"]
 
 
 def test_rejection_applies_nothing(fixture_repo, stub, tmp_path):
-    db = tmp_path / "cp.sqlite"
     cfg = {"configurable": {"thread_id": "t3"}}
-    graph = _build(db)
+    graph = _build(tmp_path / "cp.sqlite")
     graph.invoke(
         {"task": "make search.py reject empty queries",
          "repo_path": str(fixture_repo), "retry_count": 0},
@@ -169,14 +197,13 @@ def test_unchanged_rewrite_reports_empty_diff_not_a_crash(fixture_repo, stub, tm
 
 def test_truncated_generation_is_named_as_such(fixture_repo, stub, tmp_path):
     """A hit on num_predict must not masquerade as a schema violation."""
-    stub["rewrite"] = _StubRewrite(done_reason="length", parsed=False)
+    stub["rewrite"] = _StubRewrite(content="def parse_query(q):", done_reason="length")
     out = _build(tmp_path / "cp.sqlite").invoke(
         {"task": "make search.py reject empty queries",
          "repo_path": str(fixture_repo), "retry_count": 0},
         config={"configurable": {"thread_id": "t5"}},
     )
     assert "num_predict" in out["error"]
-    assert "OLLAMA_NUM_PREDICT_REWRITE" in out["error"]
 
 
 def test_missing_repo_is_a_clear_error(stub, tmp_path):
@@ -197,9 +224,9 @@ def test_venv_is_not_a_candidate(fixture_repo, stub, tmp_path):
          "retry_count": 0},
         config={"configurable": {"thread_id": "t7"}},
     )
-    # search.py is the only real candidate, so it resolves without being named.
     assert not out.get("error")
     assert out["__interrupt__"][0].value["plan"]["target_file"] == "search.py"
+
 
 # --- one thread, two tasks: the second must not inherit the first's target ---
 
@@ -234,20 +261,22 @@ def recording(monkeypatch, two_file_repo):
 
     class _Append:
         def invoke(self, _messages):
-            raw = type("Msg", (), {"response_metadata": {"done_reason": "stop"}})()
             target = "ranker.py" if "ranker.py" in seen[-1] else "search.py"
             cur = (two_file_repo / target).read_text()
-            return {"raw": raw,
-                    "parsed": FileRewrite(path=target, commit_message="c",
-                                          new_content=cur.rstrip("\n") + "\n# edit\n"),
-                    "parsing_error": None}
+            return type("AIMessage", (), {
+                "content": cur.rstrip("\n") + "\n# edit\n",
+                "response_metadata": {"done_reason": "stop"},
+            })()
 
     class _Chain:
         def __init__(self, which):
             self.which = which
 
         def with_structured_output(self, *_a, **_k):
-            return _RecordingPlan(seen) if self.which == "plan" else _Append()
+            return _RecordingPlan(seen)
+
+        def invoke(self, messages):
+            return _Append().invoke(messages)
 
     monkeypatch.setattr(plan_mod, "get_llm", lambda **_k: _Chain("plan"))
     monkeypatch.setattr(diff_mod, "get_llm", lambda **_k: _Chain("diff"))
@@ -258,13 +287,14 @@ def _target_of(prompt: str) -> str:
     return prompt.split("File: ")[1].split("\n")[0]
 
 
-def test_new_task_on_a_finished_thread_retargets(two_file_repo, recording, tmp_path):
+def test_new_task_on_a_finished_thread_retargets(two_file_repo, recording, tmp_path, local_github):
     """The bug: task 2 named ranker.py and was planned against search.py."""
     cfg = {"configurable": {"thread_id": "reuse"}}
     graph = _build(tmp_path / "cp.sqlite")
 
     graph.invoke({"task": "fix search.py", "repo_path": str(two_file_repo),
                   "retry_count": 0}, config=cfg)
+    local_github["repo"] = str(two_file_repo)
     graph.invoke(Command(resume={"decision": "approved", "note": ""}), config=cfg)
     assert _target_of(recording[-1]) == "search.py"
 

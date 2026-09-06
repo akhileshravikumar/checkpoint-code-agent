@@ -2,14 +2,14 @@
 from __future__ import annotations
 
 import sqlite3
-from pathlib import Path
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
 from app.config import get_settings
-from app.diffing import apply_patch, diff_stats
+from app.diffing import diff_stats
+from app.nodes.execute import execute_node
 from app.nodes.plan import plan_node
 from app.nodes.propose_diff import propose_diff_node
 from app.state import AgentState
@@ -37,12 +37,6 @@ def await_approval_node(state: AgentState) -> dict:
     }
 
 
-def execute_local_node(state: AgentState) -> dict:
-    """Week 1: apply to the local clone only. Week 2 replaces this with a real PR."""
-    apply_patch(Path(state["repo_path"]), state["diff"])
-    return {"error": ""}
-
-
 def route_after_approval(state: AgentState) -> str:
     status = state.get("approval_status")
     if status == "approved":
@@ -63,7 +57,7 @@ def build_graph(checkpointer):
     g.add_node("plan", plan_node)
     g.add_node("propose_diff", propose_diff_node)
     g.add_node("await_approval", await_approval_node)
-    g.add_node("execute", execute_local_node)
+    g.add_node("execute", execute_node)
     g.add_node("replan", bump_retry_node)
 
     g.add_edge(START, "plan")

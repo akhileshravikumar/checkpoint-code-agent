@@ -29,6 +29,7 @@ class AgentState(TypedDict, total=False):
 
     branch: str
     pr_url: str | None
+    head_sha: str
     ci_status: Literal["pending", "passed", "failed", "timeout"] | None
     ci_run_url: str | None
     ci_failure_log: str
@@ -56,6 +57,11 @@ def new_task(task: str, repo_path: str) -> AgentState:
         "commit_message": "",
         "approval_status": "pending",
         "edit_note": "",
+        "branch": "",
+        "pr_url": None,
+        "head_sha": "",
+        "ci_status": None,
+        "ci_run_url": None,
         "ci_failure_log": "",
         "retry_count": 0,
         "error": "",

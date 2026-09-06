@@ -11,7 +11,6 @@ which is checkpointed to SQLite and traced to LangSmith. So `_redact` is not
 decoration: without it, one failed `git remote set-url` writes the PAT into
 two durable stores and a third-party SaaS.
 """
-
 from __future__ import annotations
  
 import hashlib
@@ -146,6 +145,11 @@ class GitHubClient:
         r = self._http.get(f"/repos/{self.s.repo_slug}/branches/{name}")
         return r.status_code == 200
  
+    def remote_sha(self, branch: str) -> str:
+        r = self._http.get(f"/repos/{self.s.repo_slug}/branches/{branch}")
+        r.raise_for_status()
+        return r.json()["commit"]["sha"]
+ 
     def create_branch(self, name: str) -> None:
         self._git("checkout", "-b", name)
  
@@ -155,7 +159,24 @@ class GitHubClient:
         self._git("push", "-u", "origin", branch)
         return self._git("rev-parse", "HEAD")
  
+    def find_pr_for_branch(self, branch: str) -> PullRequest | None:
+        """An open PR already raised from this branch, if any.
+ 
+        execute can be re-entered — a resumed thread, a crash between push and
+        create_pull, a retried approval. Without this the second pass raises
+        422 "A pull request already exists" and the node reports failure for
+        work that actually succeeded.
+        """
+        for pr in self.repo.get_pulls(
+            state="open", base=self.s.github_base_branch,
+            head=f"{self.repo.owner.login}:{branch}",
+        ):
+            return PullRequest(pr.number, pr.html_url, pr.head.sha, branch)
+        return None
+ 
     def open_pr(self, branch: str, title: str, body: str) -> PullRequest:
+        if existing := self.find_pr_for_branch(branch):
+            return existing
         pr = self.repo.create_pull(
             title=title, body=body,
             base=self.s.github_base_branch, head=branch,
