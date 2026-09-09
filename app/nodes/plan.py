@@ -7,10 +7,18 @@ from app.prompts import PLAN_SYSTEM, PLAN_USER
 from app.schemas import ChangePlan
 from app.state import AgentState
 
-# Directories that are never the agent's business, and would otherwise flood
-# the candidate list in any repo with a virtualenv checked out beside the code.
+# Directories that are never the agent's business.
+#
+# Build and vendor dirs are here so a checked-out virtualenv does not flood the
+# candidate list. `tests` and `demo` are here for a different and more important
+# reason: the tests are the specification the CI loop grades the agent against,
+# so the agent must not be able to edit them. Otherwise the cheapest way to make
+# a red build green is to delete the failing test, and W2D10's self-healing loop
+# would eventually find it. Filtering `test_*.py` by name is not enough — a
+# conftest.py or a helper module inside tests/ is just as load-bearing.
 _SKIP_DIRS = {".git", ".venv", "venv", "env", "__pycache__", "node_modules",
-              ".tox", ".mypy_cache", ".pytest_cache", "build", "dist", ".workspace"}
+              ".tox", ".mypy_cache", ".pytest_cache", "build", "dist", ".workspace",
+              "tests", "test", "demo", ".github"}
 
 
 class PlanError(RuntimeError):
@@ -27,6 +35,7 @@ def _repo_root(state: AgentState) -> Path:
     if not repo.is_dir():
         raise PlanError(f"repo_path {repo} does not exist or is not a directory.")
     return repo
+
 
 def _is_replan(state: AgentState) -> bool:
     """True when we re-entered plan from the approval gate or a CI failure.
