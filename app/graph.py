@@ -13,7 +13,7 @@ from app.nodes.execute import execute_node
 from app.nodes.plan import plan_node
 from app.nodes.propose_diff import propose_diff_node
 from app.state import AgentState
-
+from app.nodes.watch_ci import watch_ci_node
 
 def await_approval_node(state: AgentState) -> dict:
     """Suspend the graph. State is checkpointed; the process may exit here.
@@ -77,7 +77,9 @@ def build_graph(checkpointer):
         {"execute": "execute", "replan": "replan", END: END},
     )
     g.add_edge("replan", "plan")
-    g.add_edge("execute", END)
+    g.add_node("watch_ci", watch_ci_node)
+    g.add_edge("execute", "watch_ci")      # replaces g.add_edge("execute", END)
+    g.add_edge("watch_ci", END)            # W2D10 makes this conditional
     return g.compile(checkpointer=checkpointer)
 
 
