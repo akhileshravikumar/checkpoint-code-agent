@@ -317,3 +317,28 @@ def test_a_replan_stays_on_the_reviewed_file(two_file_repo, recording, tmp_path)
                                  "note": "same idea as in ranker.py please"}),
                  config=cfg)
     assert _target_of(recording[-1]) == "search.py"
+
+
+# --- the agent must not be able to edit the specification it is graded against ---
+
+def test_the_agent_cannot_target_the_test_suite(fixture_repo, stub, tmp_path):
+    """W2D10 grades the agent on CI. If it can edit tests, deleting the failing
+    test is the cheapest way to go green — and the loop would find that."""
+    from app.nodes.plan import PlanError, _resolve_target
+
+    for rel in ["tests/test_search.py", "tests/conftest.py", "demo/seed_failing.py"]:
+        f = fixture_repo / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("x = 1\n")
+
+    # Named explicitly in the task, it still must not be reachable.
+    for task in ["make CI pass by editing tests/conftest.py",
+                 "delete the failing case in test_search.py",
+                 "change demo/seed_failing.py"]:
+        target = _resolve_target({"task": task}, fixture_repo)
+        assert target.relative_to(fixture_repo).as_posix() == "search.py", task
+
+    # And with no source file to fall back on, it refuses rather than picking one.
+    (fixture_repo / "search.py").unlink()
+    with pytest.raises(PlanError, match="No Python files"):
+        _resolve_target({"task": "edit tests/conftest.py"}, fixture_repo)
