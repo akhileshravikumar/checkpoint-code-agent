@@ -103,6 +103,7 @@ ws.onmessage = e => {
         m.plan.steps.map(s => `<li>${s}</li>`).join('') + '</ol>';
       $('diff-card').hidden = false;
       $('stats').textContent = `+${m.stats.additions} −${m.stats.deletions}`;
+      if (m.retry_count > 0) log(`⟳ attempt ${m.retry_count + 1} — re-planned from CI failure`);
       renderDiff(m.diff);
       $('gate').classList.add('on');
       log('diff proposed — waiting for you');
