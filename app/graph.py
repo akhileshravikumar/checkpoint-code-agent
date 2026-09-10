@@ -49,7 +49,21 @@ def route_after_approval(state: AgentState) -> str:
 
 
 def bump_retry_node(state: AgentState) -> dict:
-    return {"retry_count": state.get("retry_count", 0) + 1}
+    return {
+        "retry_count": state.get("retry_count", 0) + 1,
+        "diff": "", "new_content": "",
+        "pr_url": None, "head_sha": "", "ci_status": None, "ci_run_url": None,
+        "approval_status": "pending",
+    }
+
+def route_after_ci(state: AgentState) -> str:
+    if state.get("ci_status") == "passed":
+        return END
+    if state.get("ci_status") in {"failed", "timeout"}:
+        if state.get("retry_count", 0) >= get_settings().max_retries:
+            return END        # give up loudly rather than looping forever
+        return "replan"
+    return END
 
 
 def build_graph(checkpointer):
@@ -79,7 +93,7 @@ def build_graph(checkpointer):
     g.add_edge("replan", "plan")
     g.add_node("watch_ci", watch_ci_node)
     g.add_edge("execute", "watch_ci")      # replaces g.add_edge("execute", END)
-    g.add_edge("watch_ci", END)            # W2D10 makes this conditional
+    g.add_conditional_edges("watch_ci", route_after_ci, {"replan": "replan", END: END})
     return g.compile(checkpointer=checkpointer)
 
 
