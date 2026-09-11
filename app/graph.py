@@ -9,6 +9,7 @@ from langgraph.types import interrupt
 
 from app.config import get_settings
 from app.diffing import diff_stats
+from app.github_client import checkout_local_branch
 from app.nodes.execute import execute_node
 from app.nodes.plan import plan_node
 from app.nodes.propose_diff import propose_diff_node
@@ -49,12 +50,26 @@ def route_after_approval(state: AgentState) -> str:
 
 
 def bump_retry_node(state: AgentState) -> dict:
-    return {
+    """Prepare a retry: clear per-attempt fields, keep branch and failure log.
+
+    If an earlier attempt was pushed, put the workspace back on the agent
+    branch so the retry is planned (and its diff computed) on top of that
+    attempt rather than on main. Normally the workspace is already there, but
+    a server restart resets it to main at startup.
+    """
+    update = {
         "retry_count": state.get("retry_count", 0) + 1,
         "diff": "", "new_content": "",
         "pr_url": None, "head_sha": "", "ci_status": None, "ci_run_url": None,
         "approval_status": "pending",
+        "error": "",
     }
+    if (branch := state.get("branch")) and (repo := state.get("repo_path")):
+        try:
+            checkout_local_branch(repo, branch)
+        except RuntimeError as exc:
+            update["error"] = f"replan failed: {exc}"
+    return update
 
 def route_after_ci(state: AgentState) -> str:
     if state.get("ci_status") == "passed":
@@ -90,7 +105,11 @@ def build_graph(checkpointer):
         route_after_approval,
         {"execute": "execute", "replan": "replan", END: END},
     )
-    g.add_edge("replan", "plan")
+    g.add_conditional_edges(
+        "replan",
+        lambda s: END if s.get("error") else "plan",
+        {"plan": "plan", END: END},
+    )
     g.add_node("watch_ci", watch_ci_node)
     g.add_edge("execute", "watch_ci")      # replaces g.add_edge("execute", END)
     g.add_conditional_edges("watch_ci", route_after_ci, {"replan": "replan", END: END})

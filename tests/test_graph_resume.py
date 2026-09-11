@@ -121,6 +121,12 @@ def local_github(monkeypatch, tmp_path):
             pass
 
     monkeypatch.setattr(exec_mod, "GitHubClient", _Fake)
+    # Since W2D9 an approval runs on into watch_ci, which would build a real
+    # GitHubClient: "GITHUB_TOKEN is empty" in CI, or ten minutes polling
+    # GitHub for sha "deadbeef" with a real .env. CI is green here.
+    monkeypatch.setattr(graph_mod, "watch_ci_node", lambda state, config=None: {
+        "ci_status": "passed", "ci_run_url": "https://ci/1", "ci_failure_log": "",
+    })
     return box
 
 
