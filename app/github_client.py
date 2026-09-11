@@ -77,6 +77,13 @@ class GitHubClient:
     def __init__(self) -> None:
         s = get_settings()
         self.s = s
+        # getattr, not s.checkpoint_offline: the fake settings in
+        # tests/test_github_client.py have no such attribute.
+        if getattr(s, "checkpoint_offline", False):
+            raise RuntimeError(
+                "CHECKPOINT_OFFLINE=1: GitHub is disabled. "
+                "plan/propose_diff/approve run locally; execute is unavailable."
+            )
         if not s.github_token:
             raise RuntimeError("GITHUB_TOKEN is empty — check .env")
         # Absolute: every _git call passes -C, and a relative workspace_dir

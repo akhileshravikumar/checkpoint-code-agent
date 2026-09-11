@@ -191,14 +191,18 @@ def test_rejection_applies_nothing(fixture_repo, stub, tmp_path):
     assert (fixture_repo / "search.py").read_text() == BEFORE
 
 
-def test_unchanged_rewrite_reports_empty_diff_not_a_crash(fixture_repo, stub, tmp_path):
+def test_unchanged_rewrite_is_a_no_change_outcome_not_a_crash(fixture_repo, stub, tmp_path):
+    """A task that is already done ends quietly: no error, no gate, nothing applied."""
     stub["rewrite"] = _StubRewrite(content=BEFORE)
     out = _build(tmp_path / "cp.sqlite").invoke(
         {"task": "make search.py reject empty queries",
          "repo_path": str(fixture_repo), "retry_count": 0},
         config={"configurable": {"thread_id": "t4"}},
     )
-    assert "Empty diff" in out["error"]
+    assert not out.get("error")
+    assert "No change proposed for search.py" in out["no_change_reason"]
+    assert "__interrupt__" not in out
+    assert (fixture_repo / "search.py").read_text() == BEFORE
 
 
 def test_truncated_generation_is_named_as_such(fixture_repo, stub, tmp_path):

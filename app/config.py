@@ -38,6 +38,9 @@ class Settings(BaseSettings):
     # Observability
     langsmith_tracing: bool = True
     langsmith_project: str = "checkpoint"
+    # pydantic-settings reads .env into this object, not into os.environ, and
+    # the langsmith client only looks at os.environ. configure_tracing() exports it.
+    langsmith_api_key: str = ""
 
     # Behaviour
     checkpoint_db: Path = Path("./checkpoint.sqlite")

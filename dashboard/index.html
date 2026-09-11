@@ -34,6 +34,8 @@
   .diff .h { color:var(--acc) }
   .log div { padding:3px 0; color:var(--dim) }
   #gate { display:none; gap:8px } #gate.on { display:flex }
+  #retry { border-color:#d29922; color:#d29922; margin-bottom:10px }
+  #nochange-card { border-style:dashed } #nochange { color:var(--dim) }
 </style>
 </head>
 <body>
@@ -47,7 +49,12 @@
     <input id="task" placeholder="add input validation to search.py" autofocus>
     <button id="go">Run</button>
   </div>
-  <div class="card"><h2>Activity</h2><div class="log" id="log"></div></div>
+  <div class="card"><h2>Activity</h2>
+    <!-- not inside .row: its display:flex would override [hidden] -->
+    <button id="retry" hidden>Retry step</button>
+    <div class="log" id="log"></div>
+  </div>
+  <div class="card" id="nochange-card" hidden><h2>No change proposed</h2><div id="nochange"></div></div>
   <div class="card" id="plan-card" hidden><h2>Plan</h2><div id="plan"></div></div>
   <div class="card" id="diff-card" hidden>
     <h2>Proposed diff <span id="stats"></span></h2>
@@ -86,8 +93,25 @@ const renderDiff = text => {
 ws.onopen = () => log('connected');
 ws.onclose = () => { $('state').textContent = 'disconnected'; log('connection closed'); };
 
+const showRetry = on => { $('retry').hidden = !on; };
+
+// textContent, not innerHTML: the plan is model output.
+const renderPlan = plan => {
+  const box = $('plan'); box.innerHTML = '';
+  const b = document.createElement('b'); b.textContent = plan.summary; box.appendChild(b);
+  const ol = document.createElement('ol');
+  for (const step of plan.steps) {
+    const li = document.createElement('li'); li.textContent = step; ol.appendChild(li);
+  }
+  box.appendChild(ol);
+  $('plan-card').hidden = false;
+};
+
 ws.onmessage = e => {
   const m = JSON.parse(e.data);
+  // Any progress after an error means that error is no longer current. Also
+  // right on reconnect, when the server replays the history in order.
+  if (m.type !== 'error' && m.type !== 'session') showRetry(false);
   switch (m.type) {
     case 'session':
         $('thread').textContent = m.thread_id;
@@ -98,9 +122,8 @@ ws.onmessage = e => {
       $('state').textContent = m.message; log(m.message); break;
     case 'diff_proposed':
       $('state').textContent = 'awaiting approval';
-      $('plan-card').hidden = false;
-      $('plan').innerHTML = `<b>${m.plan.summary}</b><ol>` +
-        m.plan.steps.map(s => `<li>${s}</li>`).join('') + '</ol>';
+      $('nochange-card').hidden = true;
+      renderPlan(m.plan);
       $('diff-card').hidden = false;
       $('stats').textContent = `+${m.stats.additions} −${m.stats.deletions}`;
       if (m.retry_count > 0) log(`⟳ attempt ${m.retry_count + 1} — re-planned from CI failure`);
@@ -114,18 +137,39 @@ ws.onmessage = e => {
       log(`finished: ${m.approval_status}` + (m.pr_url ? ` → ${m.pr_url}` : ''));
       localStorage.removeItem(KEY);
       break;
+    case 'no_change':
+      // Not an error: the model found nothing to do. Nothing was applied.
+      $('state').textContent = 'no change';
+      $('gate').classList.remove('on');
+      $('diff-card').hidden = true;
+      $('nochange').textContent = m.message;
+      $('nochange-card').hidden = false;
+      if (m.plan) renderPlan(m.plan);
+      log('no change proposed — nothing applied');
+      localStorage.removeItem(KEY);
+      break;
     case 'error':
-      $('state').textContent = 'error'; log(`ERROR: ${m.message}`); break;
+      $('state').textContent = 'error';
+      log(`ERROR: ${m.message}`);
+      showRetry(!!m.resumable);    // a node crashed; its input is checkpointed
+      break;
   }
 };
 
 $('go').onclick = () => {
+  $('nochange-card').hidden = true;
   ws.send(JSON.stringify({ type: 'start', task: $('task').value }));
   $('state').textContent = 'planning…';
 };
 const decide = (decision, note = '') => {
   ws.send(JSON.stringify({ type: 'approval', decision, note }));
   $('gate').classList.remove('on');
+};
+$('retry').onclick = () => {
+  showRetry(false);
+  $('state').textContent = 'retrying…';
+  log('retrying the step that failed');
+  ws.send(JSON.stringify({ type: 'resume' }));
 };
 $('approve').onclick = () => decide('approved');
 $('reject').onclick  = () => decide('rejected');

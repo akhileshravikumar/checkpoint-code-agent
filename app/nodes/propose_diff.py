@@ -48,9 +48,7 @@ Rules:
 * Copy strings and docstrings EXACTLY as they appear, including the quoting
   style. Do not rewrap or re-quote them.
 * Keep the existing indentation style.
-* Make the smallest change that satisfies the plan.
-* The file MUST differ from the current content — returning it unchanged is a
-  failure, not a valid answer."""
+* Make the smallest change that satisfies the plan."""
 
 DIFF_USER = """Plan: {summary}
 
@@ -70,6 +68,14 @@ lines — the whole file, with only the planned change applied.
 Output the complete file now, starting with its first line:"""
 
 
+NO_CHANGE = (
+    "No change proposed for {path}. The model returned the file unchanged on "
+    "both attempts, so it may already do what you asked. Current plan: "
+    "{summary!r}. If something should change, name the exact behaviour, e.g. "
+    "which input should raise which exception."
+)
+
+
 class TruncatedError(RuntimeError):
     """Generation hit num_predict before the model finished the file."""
 
@@ -77,10 +83,15 @@ class TruncatedError(RuntimeError):
 # What to tell the model on the second attempt. Generic "try again" feedback is
 # useless when the response was structurally fine but semantically a no-op.
 _RETRY_HINTS = {
+    # Deliberately NOT "you must change something". When the task is already
+    # done, pressure to differ is how a model invents a cosmetic edit that
+    # reaches the gate looking like a real one. A second unchanged answer after
+    # this hint is taken as a considered "no change" (see NO_CHANGE below).
     "empty": (
-        "Your previous answer was byte-identical to the current file. You did "
-        "not apply the plan. Re-read the steps and produce a file that actually "
-        "differs — the specific lines the plan describes must change."
+        "Your previous answer was identical to the current file. Re-read the "
+        "plan steps and check each one against the code. If a step is not yet "
+        "implemented, apply it and return the whole file. If the file already "
+        "satisfies every step, return it unchanged again."
     ),
     "dropped": (
         "Your previous answer was NOT the complete file — it replaced the module "
@@ -150,6 +161,7 @@ def propose_diff_node(state: AgentState) -> dict:
 
     last_error = ""
     kind = ""
+    kinds: list[str] = []
 
     for attempt in range(2):  # one bounded retry (ADR-001)
         # A second pass at temperature 0.1 against an unchanged prompt
@@ -190,6 +202,7 @@ def propose_diff_node(state: AgentState) -> dict:
         except PatchError as exc:
             last_error = str(exc)
             kind = _classify(exc)
+            kinds.append(kind)
             continue
 
         return {
@@ -200,4 +213,21 @@ def propose_diff_node(state: AgentState) -> dict:
             "error": "",
         }
 
+    if kinds == ["empty", "empty"]:
+        if state.get("retry_count", 0) == 0:
+            # A fresh task that is already done is an answer, not a failure.
+            # Nothing is applied and nothing reaches the gate either way.
+            return {
+                "diff": "", "new_content": "",
+                "no_change_reason": NO_CHANGE.format(
+                    path=plan.target_file, summary=plan.summary),
+                "error": "",
+            }
+        # On a retry (CI failure or edit request) "no change" leaves the PR as
+        # it is, i.e. still red or still not what the reviewer asked for.
+        return {"error": (
+            f"The model proposed no change to {plan.target_file} on retry "
+            f"{state.get('retry_count', 0)}, so nothing was pushed. The PR is "
+            f"unchanged. Try an edit note that names the exact fix."
+        )}
     return {"error": f"Could not produce a valid patch after 2 attempts: {last_error}"}
