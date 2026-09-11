@@ -46,6 +46,8 @@ async def lifespan(app: FastAPI):
         try:
             gh = GitHubClient()
             try:
+                # Say who GitHub will see: a PAT would carry your admin bypass.
+                print(f"[startup] GitHub identity: {gh.identity}")
                 app.state.workspace = str(await asyncio.to_thread(gh.ensure_workspace))
             finally:
                 gh.close()
