@@ -76,6 +76,9 @@ def stub(monkeypatch):
         def invoke(self, messages):
             return box["rewrite"].invoke(messages)
 
+        def stream(self, messages):
+            yield self.invoke(messages)
+
     monkeypatch.setattr(plan_mod, "get_llm", lambda **_k: _Chain("plan"))
     monkeypatch.setattr(diff_mod, "get_llm", lambda **_k: _Chain("diff"))
     return box
@@ -287,6 +290,9 @@ def recording(monkeypatch, two_file_repo):
 
         def invoke(self, messages):
             return _Append().invoke(messages)
+
+        def stream(self, messages):
+            yield self.invoke(messages)
 
     monkeypatch.setattr(plan_mod, "get_llm", lambda **_k: _Chain("plan"))
     monkeypatch.setattr(diff_mod, "get_llm", lambda **_k: _Chain("diff"))

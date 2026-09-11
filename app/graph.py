@@ -31,6 +31,8 @@ def await_approval_node(state: AgentState) -> dict:
         "commit_message": state["commit_message"],
         "stats": diff_stats(state["diff"]),
         "retry_count": state.get("retry_count", 0),
+        "retry_reason": ("ci" if state.get("ci_failure_log")
+                 else "edit" if state.get("edit_note") else None),
     })
     if isinstance(decision, str):
         decision = {"decision": decision}

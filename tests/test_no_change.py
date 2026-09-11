@@ -38,6 +38,8 @@ def llm(monkeypatch):
         def invoke(self, messages):
             box["prompts"].append(messages)
             return Msg(box["script"].pop(0))
+        def stream(self, messages):
+            yield self.invoke(messages)
 
     class Plan:
         def with_structured_output(self, *_a, **_k):

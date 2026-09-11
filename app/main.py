@@ -1,11 +1,13 @@
 """FastAPI app: WebSocket endpoint plus the static dashboard."""
 import asyncio
+import subprocess
+import threading
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from langgraph.types import Command
 
@@ -13,6 +15,7 @@ from app.config import get_settings
 from app.events import bus
 from app.github_client import GitHubClient, _redact
 from app.graph import build_graph, make_checkpointer
+from app.nodes.plan import list_candidates
 from app.state import new_task
 from app.tracing import configure_tracing
 
@@ -68,12 +71,42 @@ def _spawn(fn, *args) -> None:
     task.add_done_callback(_background.discard)
 
 
-def _error(message: str, *, resumable: bool = False) -> dict:
-    """Every error string reaches the browser: redact the PAT first."""
+def _error(message: str, *, resumable: bool = False, refused: bool = False) -> dict:
+    """Every error string reaches the browser: redact the PAT first.
+
+    resumable: a node crashed and can be retried.
+    refused:   a request was turned down (wrong moment); nothing ran or changed,
+               so the dashboard must not treat it as a failed step.
+    """
     msg = {"type": "error", "message": _redact(message, get_settings().github_token)}
     if resumable:
         msg["resumable"] = True
+    if refused:
+        msg["refused"] = True
     return msg
+
+
+# Threads with a graph run in flight. While a node is running, get_state()
+# shows it in `next` exactly as it would after a crash, so "busy" and "stopped"
+# can only be told apart by tracking runs here.
+_active: set[str] = set()
+_active_lock = threading.Lock()
+
+
+def _begin(thread_id: str) -> bool:
+    with _active_lock:
+        if thread_id in _active:
+            return False
+        _active.add(thread_id)
+        return True
+
+
+def _end(thread_id: str) -> None:
+    with _active_lock:
+        _active.discard(thread_id)
+
+
+_BUSY = "A run is already in progress on this thread. Wait for it to finish."
 
 
 @app.get("/")
@@ -111,6 +144,45 @@ def thread_state(thread_id: str):
         },
     }
 
+def _current_branch(repo: Path) -> str | None:
+    """The workspace's branch, for the file panel. None if it isn't a git repo.
+
+    symbolic-ref names the branch even before its first commit; a detached
+    HEAD falls back to the short sha.
+    """
+    for args in (["symbolic-ref", "--short", "HEAD"], ["rev-parse", "--short", "HEAD"]):
+        r = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    return None
+
+
+@app.get("/files")
+def files():
+    """What the agent may edit: the same filter the planner uses."""
+    repo = Path(app.state.workspace)
+    return {
+        "branch": _current_branch(repo),
+        "editable": [str(p.relative_to(repo)) for p in list_candidates(repo)],
+        "protected": ["tests/", "demo/", ".github/"],
+    }
+
+
+@app.post("/workspace/refresh")
+def refresh_workspace():
+    """Pull origin/main after a human merge (the agent never merges).
+
+    Refused while any run is in flight: it hard-resets the workspace the graph
+    is reading and writing.
+    """
+    if _active:
+        raise HTTPException(409, "A run is in progress; pull main once it has finished.")
+    try:
+        app.state.workspace = _refresh_workspace()
+    except Exception as exc:
+        raise HTTPException(502, _redact(f"could not refresh the workspace: {exc}")) from None
+    return files()
+
 
 @app.get("/threads")
 def list_threads(limit: int = 20):
@@ -139,38 +211,55 @@ def _refresh_workspace() -> str:
 
 
 def _run_until_pause(graph, payload, config, thread_id: str) -> None:
-    """Run the graph in a worker thread; publish whatever it stops on.
+    """Run the graph in a worker thread; publish progress and whatever it stops on.
 
-    graph.invoke is blocking and CPU inference holds it for a while, so it must
-    not run on the event loop or the WebSocket would stop responding.
+    graph.stream (not invoke) so the dashboard sees each node start and finish
+    while the run is in progress. `tasks` mode gives a start event (has "input")
+    and a finish event per node; the gate's finish event carries the interrupt.
+    `custom` carries what nodes write with get_stream_writer() (token progress).
 
-    An exception here would otherwise vanish inside the background task and
-    leave the dashboard on "planning..." forever. The thread is left parked
-    mid-node with its input checkpointed, so the error is resumable: `resume`
-    re-runs that node (ADR-005: invoke(None)).
+    An exception leaves the thread parked mid-node with its input checkpointed,
+    so the error is resumable: `resume` re-runs that node (ADR-005: invoke(None)).
     """
     try:
-        result = graph.invoke(payload, config=config)
+        for mode, ev in graph.stream(payload, config=config, stream_mode=["tasks", "custom"]):
+            if mode == "tasks":
+                if "input" in ev:
+                    kind = "node_enter"
+                elif ev.get("interrupts"):
+                    kind = "node_paused"          # await_approval: the gate is open
+                else:
+                    kind = "node_exit"
+                msg = {"type": kind, "node": ev["name"]}
+                # So the PR button appears as soon as execute finishes, not only
+                # after CI. Only these two fields: node results can hold errors.
+                result = ev.get("result")
+                if kind == "node_exit" and isinstance(result, dict):
+                    msg.update({k: result[k] for k in ("pr_url", "branch") if result.get(k)})
+                bus.publish(thread_id, msg)
+            else:
+                bus.publish(thread_id, ev)        # e.g. token_progress
     except Exception as exc:
         bus.publish(thread_id, _error(f"{type(exc).__name__}: {exc}", resumable=True))
         return
-    if interrupts := result.get("__interrupt__"):
-        bus.publish(thread_id, interrupts[0].value)
-    elif err := result.get("error"):
+    finally:
+        _end(thread_id)
+
+    snap = graph.get_state(config)
+    values = snap.values
+    if snap.interrupts:
+        bus.publish(thread_id, snap.interrupts[0].value)
+    elif err := values.get("error"):
         bus.publish(thread_id, _error(err))
-    elif reason := result.get("no_change_reason"):
-        # Not an error: the model looked and found nothing to do. Show the plan
-        # so the user can see what it thought the task meant.
-        bus.publish(thread_id, {
-            "type": "no_change", "message": reason, "plan": result.get("plan"),
-        })
+    elif reason := values.get("no_change_reason"):
+        bus.publish(thread_id, {"type": "no_change", "message": reason, "plan": values.get("plan")})
     else:
         bus.publish(thread_id, {
             "type": "execution_result",
-            "approval_status": result.get("approval_status"),
-            "pr_url": result.get("pr_url"),
-            "ci_status": result.get("ci_status"),
-            "ci_run_url": result.get("ci_run_url"),
+            "approval_status": values.get("approval_status"),
+            "pr_url": values.get("pr_url"),
+            "ci_status": values.get("ci_status"),
+            "ci_run_url": values.get("ci_run_url"),
         })
 
 
@@ -212,19 +301,26 @@ async def ws(websocket: WebSocket):
 
             if msg["type"] == "start":
                 # ADR-005: an input dict restarts a thread; never do that to a
-                # thread that is paused at the gate or parked mid-node.
+                # thread that is running, paused at the gate or parked mid-node.
+                if thread_id in _active:
+                    bus.publish(thread_id, _error(_BUSY, refused=True))
+                    continue
                 if snap.interrupts:
                     bus.publish(thread_id, _error(
                         "This thread is awaiting approval. Decide on the current "
-                        "diff, or open a new session."))
+                        "diff, or open a new session.", refused=True))
                     continue
                 if snap.next:
                     bus.publish(thread_id, _error(_stopped_mid_node(snap), resumable=True))
+                    continue
+                if not _begin(thread_id):
+                    bus.publish(thread_id, _error(_BUSY, refused=True))
                     continue
                 bus.publish(thread_id, {"type": "status", "message": "refreshing workspace..."})
                 try:
                     workspace = await asyncio.to_thread(_refresh_workspace)
                 except Exception as exc:        # an expired PAT lands here
+                    _end(thread_id)
                     bus.publish(thread_id, _error(f"could not refresh the workspace: {exc}"))
                     continue
                 websocket.app.state.workspace = workspace
@@ -236,7 +332,11 @@ async def ws(websocket: WebSocket):
                 # Only for a thread parked mid-node. At the gate, None would just
                 # re-raise the interrupt; on a finished thread it does nothing.
                 if not snap.next or snap.interrupts:
-                    bus.publish(thread_id, _error("Nothing to retry on this thread."))
+                    bus.publish(thread_id, _error("Nothing to retry on this thread.",
+                                                  refused=True))
+                    continue
+                if not _begin(thread_id):
+                    bus.publish(thread_id, _error(_BUSY, refused=True))
                     continue
                 bus.publish(thread_id, {"type": "status",
                                         "message": f"retrying {', '.join(snap.next)}..."})
@@ -246,7 +346,11 @@ async def ws(websocket: WebSocket):
                 # A second click, or a stale tab, must not resume a thread that is
                 # no longer at the gate.
                 if not snap.interrupts:
-                    bus.publish(thread_id, _error("Nothing is awaiting approval on this thread."))
+                    bus.publish(thread_id, _error("Nothing is awaiting approval on this thread.",
+                                                  refused=True))
+                    continue
+                if not _begin(thread_id):
+                    bus.publish(thread_id, _error(_BUSY, refused=True))
                     continue
                 bus.publish(thread_id, {"type": "status", "message": f"{msg['decision']}..."})
                 cmd = Command(resume={
