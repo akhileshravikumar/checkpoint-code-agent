@@ -44,15 +44,25 @@ class FakeClient:
         return name in self.branches
  
     def remote_sha(self, branch):
-        return "sha-" + branch[-7:]
- 
+        return self.remote_head(branch)[0]
+
+    def remote_head(self, branch):
+        return self.calls.setdefault("heads", {})[branch]
+
     def create_branch(self, name):
         self.calls.setdefault("created", []).append(name)
         self.branches.add(name)
- 
+
+    def checkout_remote_branch(self, name):
+        self.calls.setdefault("checked_out", []).append(name)
+
     def commit_and_push(self, branch, message, paths):
-        self.calls.setdefault("pushed", []).append((branch, message, tuple(paths)))
-        return "sha-" + branch[-7:]
+        pushed = self.calls.setdefault("pushed", [])
+        pushed.append((branch, message, tuple(paths)))
+        sha = f"sha-{branch[-7:]}-{len(pushed)}"
+        self.calls.setdefault("heads", {})[branch] = (sha, message)
+        self.branches.add(branch)
+        return sha
  
     # --- PRs ---
     def find_pr_for_branch(self, branch):
@@ -161,3 +171,37 @@ def test_failures_do_not_leak_the_token(calls, monkeypatch):
     out = ex.execute_node(_state(), CFG)
     assert TOKEN not in out["error"], f"TOKEN LEAKED: {out['error']}"
     assert "***" in out["error"]
+
+# --- retries: "already done" is per attempt, not per branch -------------------
+
+
+def test_a_retry_after_ci_failure_adds_a_commit_to_the_same_pr(calls):
+    """Attempt 2 used to return the attempt-1 PR without pushing anything, so
+    watch_ci re-read the same red run and the self-healing loop could not heal."""
+    first = ex.execute_node(_state(retry_count=0), CFG)
+    second = ex.execute_node(_state(retry_count=1, diff=DIFF.replace("pass", "raise")), CFG)
+
+    assert not second["error"]
+    assert len(calls["applied"]) == 2, "attempt 2 was never applied"
+    assert len(calls["pushed"]) == 2, "attempt 2 was never pushed"
+    assert second["head_sha"] != first["head_sha"], "watch_ci would poll the old run"
+    assert second["branch"] == first["branch"]
+    assert second["pr_url"] == first["pr_url"]
+    assert len(calls["created"]) == 1, "a retry must not create another branch"
+    assert len(calls["opened"]) == 1, "a retry must not open another PR"
+    assert calls["checked_out"] == [first["branch"]], "retry must build on attempt 1"
+    assert calls["pushed"][1][1].endswith("Checkpoint-Attempt: 2")
+
+
+def test_re_running_a_retry_is_still_idempotent(calls):
+    ex.execute_node(_state(retry_count=0), CFG)
+    a = ex.execute_node(_state(retry_count=1), CFG)
+    b = ex.execute_node(_state(retry_count=1), CFG)      # crash + resume
+    assert a["head_sha"] == b["head_sha"]
+    assert len(calls["pushed"]) == 2
+    assert len(calls["applied"]) == 2
+
+
+def test_a_branch_pushed_before_the_trailer_existed_counts_as_attempt_1():
+    assert ex.pushed_attempt("fix(search): old commit with no trailer") == 1
+    assert ex.pushed_attempt(ex.with_attempt_trailer("fix: x", 3)) == 3

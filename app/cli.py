@@ -48,6 +48,9 @@ def _report(result: dict) -> None:
     if err := result.get("error"):
         console.print(f"[red]{err}[/red]")
         raise typer.Exit(1)
+    if reason := result.get("no_change_reason"):
+        console.print(f"[yellow]{reason}[/yellow]")
+        return
     console.print(f"[green]done[/green] ({result.get('approval_status')})")
 
 

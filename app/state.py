@@ -36,6 +36,9 @@ class AgentState(TypedDict, total=False):
 
     retry_count: Annotated[int, _keep_last]
     error: str
+    # Set by propose_diff when a fresh task needs no change (the model returned
+    # the file unchanged twice). Ends the run without an error or a gate.
+    no_change_reason: str
 
 def new_task(task: str, repo_path: str) -> AgentState:
     """The input for STARTING a task. Never for resuming one (ADR-005).
@@ -65,4 +68,5 @@ def new_task(task: str, repo_path: str) -> AgentState:
         "ci_failure_log": "",
         "retry_count": 0,
         "error": "",
+        "no_change_reason": "",
     }
