@@ -36,6 +36,32 @@
   #gate { display:none; gap:8px } #gate.on { display:flex }
   #retry { border-color:#d29922; color:#d29922; margin-bottom:10px }
   #nochange-card { border-style:dashed } #nochange { color:var(--dim) }
+  .dim { color:var(--dim) }
+  .timeline { display:flex; gap:6px; flex-wrap:wrap; min-height:30px }
+  .timeline span { padding:5px 10px; border:1px solid; border-radius:4px; font-size:12px }
+  .timeline span.active { border-color:var(--acc); color:var(--acc);
+                          background:rgba(88,166,255,.10);
+                          animation:pulse 1.4s ease-in-out infinite }
+  .timeline span.done { border-color:var(--add); color:var(--add) }
+  .timeline span.failed { border-color:var(--del); color:var(--del) }
+  #busy { margin-top:8px; min-height:1.4em }
+  .small { font-size:12px }
+  .card-head { display:flex; align-items:center; gap:10px; margin-bottom:10px }
+  .card-head h2 { margin:0 }
+  .grow { flex:1 }
+  button.small { padding:5px 10px; font-size:12px }
+  .files { display:flex; flex-wrap:wrap; gap:6px }
+  button.chip { padding:4px 10px; border-radius:999px; font-size:12px }
+  .links { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px }
+  .links:empty { display:none }
+  a.btn { display:inline-block; padding:6px 12px; font-size:12px; background:var(--panel);
+          border:1px solid var(--line); border-radius:6px; color:var(--fg); text-decoration:none }
+  a.btn:hover { border-color:var(--acc) }
+  a.btn.pr { border-color:var(--add) }
+  #hint { margin-top:10px; color:var(--add) }
+  .keys { color:var(--dim); font-size:12px; align-self:center; white-space:nowrap }
+  kbd { border:1px solid var(--line); border-radius:3px; padding:0 4px; font:inherit }
+  @keyframes pulse { 50% { opacity:.35 } }
 </style>
 </head>
 <body>
@@ -45,9 +71,26 @@
   <span class="pill" id="state">idle</span>
 </header>
 <main>
-  <div class="row">
-    <input id="task" placeholder="add input validation to search.py" autofocus>
-    <button id="go">Run</button>
+  <!-- a form, so Enter submits exactly like clicking Run -->
+  <form class="row" id="run" autocomplete="off">
+    <input id="task" placeholder="Describe the change you want the agent to make…" autofocus>
+    <button id="go" type="submit">Run</button>
+  </form>
+  <div class="card" id="repo-card">
+    <div class="card-head">
+      <h2>Repository</h2><span id="branch" class="dim small"></span>
+      <span class="grow"></span>
+      <button id="pull" class="small" type="button"
+              title="Fetch origin/main, e.g. after you merge the agent's PR">↻ Pull main</button>
+    </div>
+    <div class="files" id="files"></div>
+    <div class="dim small" id="protected" style="margin-top:8px"></div>
+  </div>
+  <div class="card"><h2>State</h2>
+    <div class="timeline" id="timeline"></div>
+    <div id="busy" class="dim"></div>
+    <div class="links" id="links"></div>
+    <div id="hint" hidden></div>
   </div>
   <div class="card"><h2>Activity</h2>
     <!-- not inside .row: its display:flex would override [hidden] -->
@@ -57,13 +100,14 @@
   <div class="card" id="nochange-card" hidden><h2>No change proposed</h2><div id="nochange"></div></div>
   <div class="card" id="plan-card" hidden><h2>Plan</h2><div id="plan"></div></div>
   <div class="card" id="diff-card" hidden>
-    <h2>Proposed diff <span id="stats"></span></h2>
+    <h2>Proposed diff <span id="stats"></span> <span id="pause" class="dim"></span></h2>
     <pre class="diff" id="diff"></pre>
     <div class="row" id="gate" style="margin-top:14px">
       <button id="approve">Approve</button>
       <button id="reject">Reject</button>
       <input id="note" placeholder="edit request…">
       <button id="edit">Request edit</button>
+      <span class="keys"><kbd>A</kbd> approve · <kbd>R</kbd> reject · <kbd>E</kbd> edit</span>
     </div>
   </div>
 </main>
@@ -107,6 +151,138 @@ const renderPlan = plan => {
   $('plan-card').hidden = false;
 };
 
+// ---- State timeline ----------------------------------------------------
+// Only the states this run has actually reached are shown: it starts as a
+// single "idle" pill, each node the graph enters is appended and pulses blue
+// while it is the current state, and turns green once it has finished. A node
+// that runs again (a re-plan after CI failure) gets a new pill ("plan ·2"),
+// so a retry reads as a path. Red marks the node that failed.
+const timeline = $('timeline');
+const busy = $('busy');
+let current = null;              // the pill for the state we are in right now
+let visits = {};                 // node -> times entered in this run
+
+const WHAT = {
+  plan: 'planning…',
+  propose_diff: 'writing the change…',
+  await_approval: 'waiting for your decision…',
+  execute: 'pushing a branch and opening a PR…',
+  execute_local: 'applying the change locally…',
+  watch_ci: 'waiting for GitHub Actions…',
+  replan: 're-planning…',
+  give_up: 'retries exhausted',
+};
+
+const finish = cls => { if (current) { current.className = cls || 'done'; current = null; } };
+const enter = node => {
+  // Resuming from the gate re-announces await_approval: same state, no new pill.
+  if (current && current.dataset.node === node) return;
+  finish();
+  visits[node] = (visits[node] || 0) + 1;
+  current = document.createElement('span');
+  current.dataset.node = node;
+  current.textContent = visits[node] > 1 && node !== 'idle' ? `${node} ·${visits[node]}` : node;
+  current.className = 'active';
+  timeline.appendChild(current);
+  busy.textContent = WHAT[node] || '';
+};
+const exit = node => {
+  if (current && current.dataset.node === node) finish(node === 'give_up' ? 'failed' : 'done');
+};
+const backToIdle = () => { finish(); enter('idle'); };
+const resetTimeline = () => {
+  timeline.innerHTML = ''; current = null; visits = {};
+  enter('idle');
+};
+const running = () => current && !['idle', 'await_approval'].includes(current.dataset.node);
+resetTimeline();
+
+// ---- Repository panel -----------------------------------------------------
+// The files the agent may edit, from the same filter the planner uses.
+// Clicking one puts its path into the task box. "Pull main" fetches
+// origin/main after you merge a PR; the agent never merges.
+const insertPath = path => {
+  const t = $('task'), v = t.value;
+  const at = t.selectionStart ?? v.length;
+  const before = v.slice(0, at), after = v.slice(at);
+  const lead = before && !before.endsWith(' ') ? ' ' : '';
+  const text = before + lead + path + (after.startsWith(' ') ? '' : ' ');
+  t.value = text + after;
+  t.focus();
+  t.setSelectionRange(text.length, text.length);
+};
+const renderFiles = data => {
+  $('branch').textContent = data.branch ? `on ${data.branch}` : '';
+  const box = $('files'); box.innerHTML = '';
+  if (!data.editable.length) box.textContent = 'No editable Python files in the workspace yet.';
+  for (const path of data.editable) {
+    const b = document.createElement('button');
+    b.type = 'button'; b.className = 'chip'; b.textContent = path;
+    b.title = 'Insert this path into the task';
+    b.onclick = () => insertPath(path);
+    box.appendChild(b);
+  }
+  $('protected').textContent =
+    `Read-only: ${data.protected.join(' ')} (the agent is graded by the tests, so it cannot edit them)`;
+};
+const loadFiles = () => fetch('/files')
+  .then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
+  .then(renderFiles)
+  .catch(err => log(`could not list files: ${err.message}`));
+
+// ---- Result links ---------------------------------------------------------
+const links = $('links');
+const link = (id, href, label, cls = '') => {
+  if (!/^https:\/\//.test(href || '')) return;      // only real web links
+  let a = document.getElementById(id);
+  if (!a) {
+    a = document.createElement('a');
+    a.id = id; a.className = `btn ${cls}`; a.target = '_blank'; a.rel = 'noopener';
+    links.appendChild(a);
+  }
+  a.href = href; a.textContent = label;
+};
+const prNumber = url => (String(url).match(/\/pull\/(\d+)/) || [])[1];
+const prLink = url => link('pr-link', url, prNumber(url) ? `PR #${prNumber(url)} ↗` : 'Pull request ↗', 'pr');
+const clearResults = () => { links.innerHTML = ''; $('hint').hidden = true; };
+
+// Pull main only while nothing is running and no diff is waiting: it resets
+// the workspace the graph reads from. (The server refuses too.)
+const gateOpen = () => $('gate').classList.contains('on');
+const syncControls = () => { $('pull').disabled = running() || gateOpen(); };
+
+$('pull').onclick = async () => {
+  $('pull').disabled = true;
+  log('pulling main…');
+  try {
+    const r = await fetch('/workspace/refresh', { method: 'POST' });
+    const body = await r.json();
+    if (!r.ok) throw new Error(body.detail || `HTTP ${r.status}`);
+    renderFiles(body);
+    $('hint').hidden = true;
+    log(`pulled main: ${body.editable.length} editable file(s)`);
+  } catch (err) {
+    log(`pull failed: ${err.message}`);
+  }
+  syncControls();
+};
+
+// The human-pause timer: how long a diff sits waiting on a person. Started
+// when the gate opens, stopped (and logged) the moment a decision is sent.
+let pauseStart = null, pauseTimer = null;
+const startPause = () => {
+  clearInterval(pauseTimer);   // in case a diff is re-proposed before a decision
+  pauseStart = Date.now();
+  pauseTimer = setInterval(() => {
+    $('pause').textContent = `human pause: ${((Date.now() - pauseStart) / 1000).toFixed(0)}s`;
+  }, 200);
+};
+const endPause = () => {
+  clearInterval(pauseTimer);
+  if (pauseStart) log(`decision after ${((Date.now() - pauseStart) / 1000).toFixed(1)}s`);
+  pauseStart = null;
+};
+
 ws.onmessage = e => {
   const m = JSON.parse(e.data);
   // Any progress after an error means that error is no longer current. Also
@@ -117,25 +293,68 @@ ws.onmessage = e => {
         $('thread').textContent = m.thread_id;
         localStorage.setItem(KEY, m.thread_id);
         history.replaceState(null, '', `?thread_id=${m.thread_id}`);
+        loadFiles();
         break;
     case 'status':
-      $('state').textContent = m.message; log(m.message); break;
+      $('state').textContent = m.message; log(m.message);
+      if (current && current.dataset.node === 'idle') busy.textContent = m.message;
+      break;
+    case 'node_enter':
+      enter(m.node);
+      break;
+    case 'node_exit':
+      exit(m.node);
+      if (m.pr_url) prLink(m.pr_url);          // execute finished: the PR exists now
+      break;
+    case 'ci_status':
+      busy.textContent = `CI: ${m.status}` + (m.message ? ` — ${m.message}` : '');
+      if (m.run_url) link('ci-link', m.run_url, 'CI run ↗');
+      break;
+    case 'node_paused':
+      // The gate stays the current state (blue) until you decide.
+      busy.textContent = WHAT.await_approval;
+      break;
+    case 'token_progress':
+      busy.textContent = `writing the change (attempt ${m.attempt} of ${m.max_attempts || 2})… ${m.tokens} tokens`;
+      break;
     case 'diff_proposed':
+      // After a server restart the gate arrives without node events.
+      enter('await_approval');
+      busy.textContent = WHAT.await_approval;
       $('state').textContent = 'awaiting approval';
       $('nochange-card').hidden = true;
       renderPlan(m.plan);
       $('diff-card').hidden = false;
       $('stats').textContent = `+${m.stats.additions} −${m.stats.deletions}`;
-      if (m.retry_count > 0) log(`⟳ attempt ${m.retry_count + 1} — re-planned from CI failure`);
+      if (m.retry_count > 0) {
+        const why = { ci: 're-planned from the CI failure', edit: 're-planned from your edit request' };
+        log(`⟳ attempt ${m.retry_count + 1} — ${why[m.retry_reason] || 're-planned'}`);
+      }
+      // Let A / R / E work straight away unless you are typing a new task.
+      if (document.activeElement === $('task') && !$('task').value) $('task').blur();
       renderDiff(m.diff);
       $('gate').classList.add('on');
+      startPause();
       log('diff proposed — waiting for you');
       break;
     case 'execution_result':
       $('state').textContent = m.approval_status;
       $('gate').classList.remove('on');
       log(`finished: ${m.approval_status}` + (m.pr_url ? ` → ${m.pr_url}` : ''));
+      if (m.pr_url) prLink(m.pr_url);
+      if (m.ci_run_url) link('ci-link', m.ci_run_url, 'CI run ↗');
+      if (m.approval_status === 'approved' && m.ci_status === 'passed' && m.pr_url) {
+        // Merge-first: the next task only sees this change once you merge it.
+        const n = prNumber(m.pr_url);
+        $('hint').textContent = `${n ? `PR #${n}` : 'The PR'} is ready. Merge it on GitHub, ` +
+                                'then ↻ Pull main to plan the next change against it.';
+        $('hint').hidden = false;
+      } else if (m.approval_status === 'approved' && !m.pr_url) {
+        log('applied locally (offline mode): nothing was pushed');
+      }
       localStorage.removeItem(KEY);
+      backToIdle();
+      loadFiles();
       break;
     case 'no_change':
       // Not an error: the model found nothing to do. Nothing was applied.
@@ -147,23 +366,54 @@ ws.onmessage = e => {
       if (m.plan) renderPlan(m.plan);
       log('no change proposed — nothing applied');
       localStorage.removeItem(KEY);
+      backToIdle();
       break;
     case 'error':
+      if (m.refused) {                 // turned down, nothing ran: state is unchanged
+        log(`refused: ${m.message}`);
+        break;
+      }
       $('state').textContent = 'error';
       log(`ERROR: ${m.message}`);
       showRetry(!!m.resumable);    // a node crashed; its input is checkpointed
+      if (running()) {
+        finish('failed');          // it stopped inside this node
+      } else if (!current && timeline.lastElementChild) {
+        timeline.lastElementChild.className = 'failed';   // the node that returned the error
+      }
+      // A refused action (e.g. Run while the gate is open) leaves the state as it is.
+      if (!m.resumable && !current) backToIdle();
+      if (m.resumable) busy.textContent = 'stopped — use Retry step';
       break;
   }
+  syncControls();
 };
 
-$('go').onclick = () => {
+$('run').onsubmit = e => {
+  e.preventDefault();                       // Enter and the Run button both land here
+  const task = $('task').value.trim();
+  if (!task) return;
+  if (ws.readyState !== WebSocket.OPEN) { log('not connected — reload the page'); return; }
+  // Keep the text when nothing is sent, so it isn't lost.
+  if ($('gate').classList.contains('on')) { log('decide on the current diff first'); return; }
+  if (running()) { log('a run is already in progress'); return; }
   $('nochange-card').hidden = true;
-  ws.send(JSON.stringify({ type: 'start', task: $('task').value }));
+  clearInterval(pauseTimer);
+  $('pause').textContent = '';
+  resetTimeline();
+  clearResults();
+  ws.send(JSON.stringify({ type: 'start', task }));
+  log(`task: ${task}`);
+  $('task').value = '';
   $('state').textContent = 'planning…';
+  syncControls();
 };
 const decide = (decision, note = '') => {
+  if (!gateOpen()) return;              // a second click or key press sends nothing
+  endPause();
   ws.send(JSON.stringify({ type: 'approval', decision, note }));
   $('gate').classList.remove('on');
+  syncControls();
 };
 $('retry').onclick = () => {
   showRetry(false);
@@ -173,7 +423,28 @@ $('retry').onclick = () => {
 };
 $('approve').onclick = () => decide('approved');
 $('reject').onclick  = () => decide('rejected');
-$('edit').onclick    = () => decide('edit_requested', $('note').value);
+$('edit').onclick    = () => {
+  const note = $('note').value.trim();
+  if (!note) { log('write what should change first'); $('note').focus(); return; }
+  decide('edit_requested', note);
+  $('note').value = '';
+};
+$('note').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); $('edit').click(); }
+  if (e.key === 'Escape') $('note').blur();
+});
+
+// Keyboard shortcuts while a diff is waiting: A approve, R reject, E edit.
+// Ignored while typing in a box, so a task or edit note can contain these letters.
+document.addEventListener('keydown', e => {
+  if (!gateOpen() || e.ctrlKey || e.metaKey || e.altKey) return;
+  if (['INPUT', 'TEXTAREA'].includes(e.target.tagName)) return;
+  const key = e.key.toLowerCase();
+  if (key === 'a') { e.preventDefault(); decide('approved'); }
+  else if (key === 'r') { e.preventDefault(); decide('rejected'); }
+  else if (key === 'e') { e.preventDefault(); $('note').focus(); }
+});
+syncControls();
 </script>
 </body>
 </html>

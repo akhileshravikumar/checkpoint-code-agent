@@ -175,3 +175,108 @@ def test_dashboard_is_never_served_from_cache(client):
     assert r.status_code == 200
     assert r.headers["cache-control"] == "no-store"
     assert "case 'no_change'" in r.text
+
+
+def test_files_lists_what_the_agent_may_edit(client, tmp_path):
+    """/files once raised NameError (list_candidates was never imported)."""
+    c, _ = client
+    (tmp_path / "sandbox").mkdir()
+    (tmp_path / "sandbox" / "search.py").write_text("x = 1\n")
+    (tmp_path / "sandbox" / "twosum.py").write_text("y = 2\n")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_search.py").write_text("")
+    r = c.get("/files")
+    assert r.status_code == 200
+    assert r.json()["editable"] == ["sandbox/search.py", "sandbox/twosum.py"]
+    assert "tests/" in r.json()["protected"]
+
+
+def _with_github_stubbed(monkeypatch):
+    monkeypatch.setattr(graph_mod, "execute_node", lambda state, config=None: {
+        "branch": "checkpoint/x-1", "pr_url": "https://github.com/o/r/pull/9",
+        "head_sha": "abc", "ci_status": "pending", "error": ""})
+    monkeypatch.setattr(graph_mod, "watch_ci_node", lambda state, config=None: {
+        "ci_status": "passed", "ci_run_url": "https://github.com/o/r/actions/runs/1",
+        "ci_failure_log": ""})
+    main.app.state.graph = graph_mod.build_graph(main.app.state.graph.checkpointer)
+
+
+def test_the_pr_link_arrives_when_execute_finishes(client, monkeypatch):
+    c, _ = client
+    _with_github_stubbed(monkeypatch)
+    with c.websocket_connect("/ws?thread_id=p1") as ws:
+        ws.send_json({"type": "start", "task": "fix sandbox/search.py"})
+        _until(ws, "diff_proposed")
+        ws.send_json({"type": "approval", "decision": "approved"})
+        seen = _until(ws, "execution_result")
+    done = next(m for m in seen if m["type"] == "node_exit" and m["node"] == "execute")
+    assert done["pr_url"] == "https://github.com/o/r/pull/9"
+    assert done["branch"] == "checkpoint/x-1"
+    assert seen.index(done) < [m["type"] for m in seen].index("node_enter", seen.index(done)), \
+        "before watch_ci starts"
+    assert seen[-1]["ci_status"] == "passed"
+
+
+def test_a_busy_thread_refuses_instead_of_claiming_a_crash(client):
+    c, _ = client
+    main._active.add("b1")
+    try:
+        with c.websocket_connect("/ws?thread_id=b1") as ws:
+            for msg in ({"type": "start", "task": "x"}, {"type": "resume"}):
+                ws.send_json(msg)
+                err = _until(ws, "error")[-1]
+                assert err.get("refused") is True
+                assert "resumable" not in err
+                assert "in progress" in err["message"] or "Nothing to retry" in err["message"]
+    finally:
+        main._active.discard("b1")
+
+
+def test_guard_errors_are_marked_refused(client):
+    c, _ = client
+    with c.websocket_connect("/ws?thread_id=b2") as ws:
+        ws.send_json({"type": "approval", "decision": "approved"})
+        assert _until(ws, "error")[-1]["refused"] is True
+
+
+def test_a_finished_run_is_no_longer_active(client):
+    c, _ = client
+    with c.websocket_connect("/ws?thread_id=b3") as ws:
+        ws.send_json({"type": "start", "task": "fix sandbox/search.py"})
+        _until(ws, "diff_proposed")
+    assert "b3" not in main._active, "paused at the gate is not running"
+
+
+def test_pull_main_is_refused_while_a_run_is_active(client):
+    c, _ = client
+    main._active.add("r1")
+    try:
+        r = c.post("/workspace/refresh")
+        assert r.status_code == 409
+    finally:
+        main._active.discard("r1")
+
+
+def test_pull_main_returns_the_file_list(client, tmp_path):
+    c, _ = client
+    (tmp_path / "app.py").write_text("x = 1\n")
+    r = c.post("/workspace/refresh")
+    assert r.status_code == 200
+    assert "app.py" in r.json()["editable"]
+    assert "branch" in r.json()
+
+
+def test_pull_main_failures_are_redacted(client, monkeypatch):
+    c, _ = client
+    def boom():
+        raise RuntimeError(f"fetch failed for https://x-access-token:{TOKEN}@github.com/o/r")
+    monkeypatch.setattr(main, "_refresh_workspace", boom)
+    r = c.post("/workspace/refresh")
+    assert r.status_code == 502
+    assert TOKEN not in r.text
+
+
+def test_files_names_the_workspace_branch(client, tmp_path):
+    import subprocess
+    subprocess.run(["git", "init", "-q", "-b", "main", str(tmp_path)], check=True)
+    assert client[0].get("/files").json()["branch"] == "main", "even before the first commit"

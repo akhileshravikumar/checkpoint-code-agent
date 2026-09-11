@@ -47,6 +47,13 @@ def _is_replan(state: AgentState) -> bool:
     """
     return bool(state.get("edit_note") or state.get("ci_failure_log"))
 
+def list_candidates(repo: Path) -> list[Path]:
+    return sorted(
+        f for f in repo.rglob("*.py")
+        if not (_SKIP_DIRS & set(f.relative_to(repo).parts))
+        and not f.name.startswith("test_") and not f.name.endswith("_test.py")
+    )
+
 
 def _resolve_target(state: AgentState, repo: Path) -> Path:
     """Locate the target file. On a replan, stay on the file already chosen."""
@@ -60,12 +67,7 @@ def _resolve_target(state: AgentState, repo: Path) -> Path:
             )
         return prior
 
-    candidates = [
-        f for f in repo.rglob("*.py")
-        if not (_SKIP_DIRS & set(f.relative_to(repo).parts))
-        and not f.name.startswith("test_")
-        and not f.name.endswith("_test.py")
-    ]
+    candidates = list_candidates(repo)
     if not candidates:
         raise PlanError(f"No Python files found under {repo}.")
 

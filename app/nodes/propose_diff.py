@@ -20,6 +20,7 @@ in commentary. Both are cheap to strip, and `check_rewrite` rejects anything
 else — which is the same bargain as ADR-001, just moved one layer out.
 """
 from pathlib import Path
+from langgraph.config import get_stream_writer
 
 from app.config import get_settings
 from app.diffing import (
@@ -74,6 +75,9 @@ NO_CHANGE = (
     "{summary!r}. If something should change, name the exact behaviour, e.g. "
     "which input should raise which exception."
 )
+
+
+MAX_ATTEMPTS = 2   # the first try plus one bounded retry (ADR-001)
 
 
 class TruncatedError(RuntimeError):
@@ -133,8 +137,37 @@ def _commit_message(plan: ChangePlan) -> str:
     summary = plan.summary.strip().rstrip(".")
     if summary:
         summary = summary[0].lower() + summary[1:]
-    return f"fix({scope}): {summary or 'apply planned change'}"[:72]
+    msg = f"fix({scope}): {summary or 'apply planned change'}"
+    if len(msg) <= 72:
+        return msg
+    # Cut at the last word boundary, never mid-word: titles like
+    # "...to the parse_query function to ensur" end up on public PRs.
+    head = msg[:72]
+    cut = head.rsplit(" ", 1)[0].rstrip(" ,;:-`(")
+    return cut if len(cut) > len(f"fix({scope}): ") else head
 
+def _writer():
+    """The graph's stream writer, or a no-op when called outside a graph run."""
+    try:
+        return get_stream_writer()
+    except RuntimeError:
+        return lambda _ev: None
+
+
+def _generate(llm, messages, attempt: int):
+    """Stream the completion, reporting progress; return the merged message.
+
+    Merging the chunks keeps response_metadata, so done_reason (truncation
+    detection) works exactly as it did with invoke().
+    """
+    write, full, n = _writer(), None, 0
+    for chunk in llm.stream(messages):
+        full = chunk if full is None else full + chunk
+        n += 1
+        if n % 20 == 0:                   # ~1 update/second on CPU
+            write({"type": "token_progress", "node": "propose_diff",
+                   "attempt": attempt, "max_attempts": MAX_ATTEMPTS, "tokens": n})
+    return full
 
 def propose_diff_node(state: AgentState) -> dict:
     s = get_settings()
@@ -163,12 +196,13 @@ def propose_diff_node(state: AgentState) -> dict:
     kind = ""
     kinds: list[str] = []
 
-    for attempt in range(2):  # one bounded retry (ADR-001)
+    for attempt in range(MAX_ATTEMPTS):  # one bounded retry (ADR-001)
         # A second pass at temperature 0.1 against an unchanged prompt
         # re-samples almost the same tokens. Nudge it off the previous mode.
         llm = get_llm(
             num_predict=s.ollama_num_predict_rewrite,
             temperature=s.ollama_temperature if attempt == 0 else 0.4,
+            streaming=True,
         )
 
         messages = list(prompt)
@@ -176,7 +210,7 @@ def propose_diff_node(state: AgentState) -> dict:
             messages.append(("user", _RETRY_HINTS[kind] + f"\n\n(Error: {last_error})"))
 
         try:
-            resp = llm.invoke(messages)
+            resp = _generate(llm, messages, attempt + 1)
 
             meta = getattr(resp, "response_metadata", {}) or {}
             if meta.get("done_reason") == "length":
@@ -230,4 +264,4 @@ def propose_diff_node(state: AgentState) -> dict:
             f"{state.get('retry_count', 0)}, so nothing was pushed. The PR is "
             f"unchanged. Try an edit note that names the exact fix."
         )}
-    return {"error": f"Could not produce a valid patch after 2 attempts: {last_error}"}
+    return {"error": f"Could not produce a valid patch after {MAX_ATTEMPTS} attempts: {last_error}"}
