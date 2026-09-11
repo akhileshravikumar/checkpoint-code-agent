@@ -37,6 +37,34 @@ class PullRequest:
     branch: str
  
  
+def checkout_local_branch(repo: str | Path, branch: str) -> bool:
+    """Switch `repo` to the local copy of origin/<branch>, if one exists.
+
+    No network and no token: it uses the remote-tracking ref the last push
+    left behind. Called on a re-plan so the retry is planned against the
+    agent branch (attempt N-1 included), not against main. That matters after
+    a server restart, because startup resets the workspace to main.
+
+    Returns False, and changes nothing, when there is no such ref, which is
+    always the case for a local test fixture or a Week-1 workspace.
+    """
+    repo = str(repo)
+    ref = f"refs/remotes/origin/{branch}"
+    probe = subprocess.run(
+        ["git", "-C", repo, "rev-parse", "--verify", "--quiet", ref],
+        capture_output=True, text=True,
+    )
+    if probe.returncode != 0:
+        return False
+    r = subprocess.run(
+        ["git", "-C", repo, "checkout", "-f", "-B", branch, ref],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(f"could not check out {branch}: {r.stderr.strip()}")
+    return True
+
+
 def _redact(text: str, *secrets: str) -> str:
     """Replace any occurrence of a secret, and any user:pass in a URL."""
     for sec in secrets:
@@ -49,6 +77,13 @@ class GitHubClient:
     def __init__(self) -> None:
         s = get_settings()
         self.s = s
+        # getattr, not s.checkpoint_offline: the fake settings in
+        # tests/test_github_client.py have no such attribute.
+        if getattr(s, "checkpoint_offline", False):
+            raise RuntimeError(
+                "CHECKPOINT_OFFLINE=1: GitHub is disabled. "
+                "plan/propose_diff/approve run locally; execute is unavailable."
+            )
         if not s.github_token:
             raise RuntimeError("GITHUB_TOKEN is empty — check .env")
         # Absolute: every _git call passes -C, and a relative workspace_dir
@@ -149,9 +184,29 @@ class GitHubClient:
         r = self._http.get(f"/repos/{self.s.repo_slug}/branches/{branch}")
         r.raise_for_status()
         return r.json()["commit"]["sha"]
- 
+
+    def remote_head(self, branch: str) -> tuple[str, str]:
+        """(sha, commit message) of the remote branch tip.
+
+        execute reads the Checkpoint-Attempt trailer from the message to tell
+        "this approval was already pushed" apart from "this is a new attempt".
+        """
+        r = self._http.get(f"/repos/{self.s.repo_slug}/branches/{branch}")
+        r.raise_for_status()
+        commit = r.json()["commit"]
+        return commit["sha"], commit["commit"]["message"]
+
     def create_branch(self, name: str) -> None:
         self._git("checkout", "-b", name)
+
+    def checkout_remote_branch(self, name: str) -> None:
+        """Put the workspace on the tip of an existing remote branch.
+
+        A retry after a CI failure has to commit on top of the previous
+        attempt, not on top of main. ensure_workspace() leaves us on main.
+        """
+        self._git("fetch", "origin", f"+refs/heads/{name}:refs/remotes/origin/{name}")
+        self._git("checkout", "-f", "-B", name, f"origin/{name}")
  
     def commit_and_push(self, branch: str, message: str, paths: list[str]) -> str:
         self._git("add", *paths)

@@ -86,3 +86,26 @@ def test_branch_name_is_deterministic_with_a_seed(client):
     assert a != c
     assert a.startswith("checkpoint/add-validation-to-search-py-")
     print("\n   branch ->", a)
+
+def _push_attempt_1(client, branch="checkpoint/x-1"):
+    p = client.ensure_workspace()
+    client.create_branch(branch)
+    (p / "search.py").write_text("ATTEMPT 1\n")
+    client.commit_and_push(branch, "attempt 1", ["search.py"])
+    client.ensure_workspace()                 # back on main, as execute leaves it
+    assert (p / "search.py").read_text().startswith("def parse_query")
+    return p, branch
+
+
+def test_a_retry_is_committed_on_top_of_the_previous_attempt(client):
+    p, branch = _push_attempt_1(client)
+    client.checkout_remote_branch(branch)
+    assert client._git("rev-parse", "--abbrev-ref", "HEAD") == branch
+    assert (p / "search.py").read_text() == "ATTEMPT 1\n"
+
+
+def test_a_replan_returns_to_the_agent_branch_without_network(client):
+    p, branch = _push_attempt_1(client)
+    assert gc.checkout_local_branch(p, branch) is True
+    assert (p / "search.py").read_text() == "ATTEMPT 1\n"
+    assert gc.checkout_local_branch(p, "checkpoint/never-pushed") is False
