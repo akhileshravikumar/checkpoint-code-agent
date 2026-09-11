@@ -1,15 +1,23 @@
 """GitHub integration: workspace clone, branch, commit, PR, Actions polling.
- 
-Auth is a fine-grained PAT scoped to exactly one repository with four
-permissions (ARCHITECTURE.md §7). If something here needs a broader scope,
-the bug is in this file, not in the token.
- 
-SECRET HANDLING. Pushing with a fine-grained PAT over HTTPS means the token
-appears in the remote URL, which means it appears in argv and in git's own
-error output. Every error raised from this module goes into state["error"],
-which is checkpointed to SQLite and traced to LangSmith. So `_redact` is not
-decoration: without it, one failed `git remote set-url` writes the PAT into
-two durable stores and a third-party SaaS.
+
+IDENTITY (ADR-010). The agent authenticates as its own GitHub App, installed on
+the sandbox repository only, with four permissions: Contents RW, Pull requests
+RW, Actions R, Metadata R. Branch protection on `main` lets repository admins
+bypass it (enforce_admins=false) so the owner can push directly; the App is
+not an admin, so for it the protection holds. That is what makes "the agent
+has never been able to write to main" literally true.
+
+A fine-grained PAT (GITHUB_TOKEN) still works as a fallback, but a PAT acts as
+the person who created it, so it inherits that person's admin bypass. The
+startup log says which identity is in use.
+
+SECRET HANDLING. Pushing over HTTPS puts the token in the remote URL, which
+means it appears in argv and in git's own error output. Every error raised from
+this module goes into state["error"], which is checkpointed to SQLite and
+traced to LangSmith. So `_redact` is not decoration: without it, one failed
+`git remote set-url` writes the token into two durable stores and a
+third-party SaaS. Installation tokens are minted at runtime, so callers cannot
+pass them to `_redact`; every minted token is registered and always redacted.
 """
 from __future__ import annotations
  
@@ -17,12 +25,14 @@ import hashlib
 import re
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
  
 import httpx
-from github import Auth, Github
+from github import Auth, Github, GithubException, GithubIntegration
  
 from app.config import get_settings
  
@@ -65,12 +75,160 @@ def checkout_local_branch(repo: str | Path, branch: str) -> bool:
     return True
 
 
+# Every token this process has minted or loaded. Redacted everywhere, whether
+# or not the caller knew about it.
+_SECRETS: set[str] = set()
+
+
+def _register_secret(secret: str) -> None:
+    if secret:
+        _SECRETS.add(secret)
+
+
 def _redact(text: str, *secrets: str) -> str:
-    """Replace any occurrence of a secret, and any user:pass in a URL."""
-    for sec in secrets:
+    """Replace any known secret, and any user:pass in a URL."""
+    for sec in {*secrets, *_SECRETS}:
         if sec:
             text = text.replace(sec, "***")
     return re.sub(r"://[^/\s:]+:[^@/\s]+@", "://***:***@", text)
+
+
+# ---------- credentials ----------
+
+# The installation token scope requested from GitHub. Narrower than or equal
+# to what the App was granted; asking for exactly this means a token cannot
+# carry a permission added to the App later by mistake.
+APP_TOKEN_PERMISSIONS = {
+    "contents": "write",
+    "pull_requests": "write",
+    "actions": "read",
+    "metadata": "read",
+}
+
+
+@dataclass
+class Credentials:
+    token: str
+    identity: str            # for logs: who GitHub will see
+    git_name: str
+    git_email: str
+    expires_at: float = float("inf")
+
+
+_cache: dict[tuple, Credentials] = {}
+_cache_lock = threading.Lock()
+
+
+def _app_configured(s) -> bool:
+    return bool(getattr(s, "github_app_id", "") and getattr(s, "github_app_private_key_path", ""))
+
+
+def _mint_app_credentials(s) -> Credentials:
+    """Exchange the App's private key for a one-hour installation token."""
+    key_path = Path(s.github_app_private_key_path).expanduser()
+    if not key_path.is_file():
+        raise RuntimeError(
+            f"GITHUB_APP_PRIVATE_KEY_PATH points at {key_path}, which does not exist. "
+            "Download a private key from the App settings page (see docs/github-app-setup.md)."
+        )
+    gi = GithubIntegration(auth=Auth.AppAuth(str(s.github_app_id), key_path.read_text()))
+    try:
+        installation_id = int(getattr(s, "github_app_installation_id", 0) or 0)
+        if not installation_id:
+            try:
+                installation_id = gi.get_repo_installation(s.github_owner, s.github_repo).id
+            except GithubException as exc:
+                raise _app_error(exc, s, not_found=(
+                    f"The GitHub App is not installed on {s.repo_slug}. Install it on "
+                    "that repository only (see docs/github-app-setup.md).")) from None
+        try:
+            grant = gi.get_access_token(installation_id, permissions=APP_TOKEN_PERMISSIONS)
+        except GithubException as exc:
+            raise _app_error(exc, s, not_found=(
+                f"Installation {installation_id} does not exist for this App. Set "
+                "GITHUB_APP_INSTALLATION_ID=0 to look it up."), unprocessable=(
+                "GitHub refused an installation token with Contents RW, Pull requests RW, "
+                "Actions R and Metadata R. Check the App's permissions, and accept the "
+                "updated permissions on the installation if you changed them.")) from None
+        slug = gi.get_app().slug
+    finally:
+        gi.close()
+
+    _register_secret(grant.token)
+    bot = f"{slug}[bot]"
+    expires = grant.expires_at
+    if isinstance(expires, datetime):
+        expires = (expires if expires.tzinfo else expires.replace(tzinfo=timezone.utc)).timestamp()
+    else:
+        expires = time.time() + 3600
+    return Credentials(
+        token=grant.token,
+        identity=f"{bot} (GitHub App)",
+        git_name=bot,
+        git_email=_bot_email(bot, grant.token),
+        expires_at=expires,
+    )
+
+
+def _app_error(exc: GithubException, s, *, not_found: str, unprocessable: str = "") -> RuntimeError:
+    """Turn GitHub's status codes into the one fix that applies."""
+    if exc.status == 401:
+        msg = (f"GitHub rejected the App's signed request: GITHUB_APP_ID={s.github_app_id} "
+               "is wrong, or the .pem belongs to a different App.")
+    elif exc.status == 404:
+        msg = not_found
+    elif exc.status == 422 and unprocessable:
+        msg = unprocessable
+    else:
+        msg = "GitHub App authentication failed."
+    detail = exc.data.get("message") if isinstance(exc.data, dict) else exc.data
+    return RuntimeError(_redact(f"{msg} (HTTP {exc.status}: {detail})"))
+
+
+def _bot_email(bot: str, token: str) -> str:
+    """The noreply address GitHub links to the App's bot account.
+
+    With it, commits show the App's avatar and name instead of an unknown
+    author. The numeric id is only known by asking; fall back without it.
+    """
+    try:
+        r = httpx.get(f"{API}/users/{bot}", timeout=10.0,
+                      headers={"Authorization": f"Bearer {token}",
+                               "Accept": "application/vnd.github+json"})
+        r.raise_for_status()
+        return f"{r.json()['id']}+{bot}@users.noreply.github.com"
+    except Exception:
+        return f"{bot}@users.noreply.github.com"
+
+
+def credentials(s=None) -> Credentials:
+    """The credentials the agent uses: the GitHub App if configured, else the PAT.
+
+    Installation tokens last an hour; one is reused until it has less than ten
+    minutes left, so a long watch_ci poll never runs on an expiring token.
+    """
+    s = s or get_settings()
+    if _app_configured(s):
+        key = ("app", str(s.github_app_id), str(getattr(s, "github_app_installation_id", "")),
+               s.repo_slug)
+        with _cache_lock:
+            cached = _cache.get(key)
+            if cached and cached.expires_at - time.time() > 600:
+                return cached
+            fresh = _cache[key] = _mint_app_credentials(s)
+            return fresh
+    if s.github_token:
+        _register_secret(s.github_token)
+        return Credentials(
+            token=s.github_token,
+            identity="personal access token (acts as you, including your admin bypass)",
+            git_name="checkpoint-agent",
+            git_email="checkpoint-agent@users.noreply.github.com",
+        )
+    raise RuntimeError(
+        "No GitHub credentials. Set GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY_PATH "
+        "(recommended, see docs/github-app-setup.md), or GITHUB_TOKEN."
+    )
  
  
 class GitHubClient:
@@ -84,15 +242,18 @@ class GitHubClient:
                 "CHECKPOINT_OFFLINE=1: GitHub is disabled. "
                 "plan/propose_diff/approve run locally; execute is unavailable."
             )
-        if not s.github_token:
-            raise RuntimeError("GITHUB_TOKEN is empty — check .env")
+        creds = credentials(s)
+        self.token = creds.token
+        self.identity = creds.identity
+        self._git_name, self._git_email = creds.git_name, creds.git_email
         # Absolute: every _git call passes -C, and a relative workspace_dir
         # silently follows the process's cwd.
         self.workspace = Path(s.workspace_dir).expanduser().resolve()
+        # x-access-token works for both a PAT and an App installation token.
         self.remote = (
-            f"https://x-access-token:{s.github_token}@github.com/{s.repo_slug}.git"
+            f"https://x-access-token:{self.token}@github.com/{s.repo_slug}.git"
         )
-        self.gh = Github(auth=Auth.Token(s.github_token))
+        self.gh = Github(auth=Auth.Token(self.token))
         try:
             self.repo = self.gh.get_repo(s.repo_slug)
         except Exception:
@@ -101,7 +262,7 @@ class GitHubClient:
         self._http = httpx.Client(
             base_url=API,
             headers={
-                "Authorization": f"Bearer {s.github_token}",
+                "Authorization": f"Bearer {self.token}",
                 "Accept": "application/vnd.github+json",
                 "X-GitHub-Api-Version": "2022-11-28",
             },
@@ -139,9 +300,10 @@ class GitHubClient:
             self._run(["git", "clone", self.remote, str(path)])
  
         self._git("remote", "set-url", "origin", self.remote)
-        self._git("config", "user.name", "checkpoint-agent")
-        self._git("config", "user.email",
-                  "checkpoint-agent@users.noreply.github.com")
+        # With an App these are the bot's name and noreply address, so the
+        # commits are attributed to the agent, not to a person.
+        self._git("config", "user.name", self._git_name)
+        self._git("config", "user.email", self._git_email)
         self._git("fetch", "origin", s.github_base_branch)
         self._git("checkout", "-f", s.github_base_branch)
         self._git("reset", "--hard", f"origin/{s.github_base_branch}")
@@ -151,10 +313,8 @@ class GitHubClient:
     def _run(self, cmd: list[str]) -> str:
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
-            shown = _redact(" ".join(cmd), self.s.github_token)
-            raise RuntimeError(
-                f"{shown} failed: {_redact(r.stderr.strip(), self.s.github_token)}"
-            )
+            shown = _redact(" ".join(cmd), self.token)
+            raise RuntimeError(f"{shown} failed: {_redact(r.stderr.strip(), self.token)}")
         return r.stdout.strip()
  
     def _git(self, *args: str) -> str:

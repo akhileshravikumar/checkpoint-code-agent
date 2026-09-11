@@ -29,6 +29,13 @@ class Settings(BaseSettings):
     ollama_num_thread: int = 0
 
     # Target repository
+    # The agent's identity is a GitHub App (ADR-010): App id, the path to its
+    # private key (.pem, kept OUTSIDE the repo), and optionally the installation
+    # id (looked up from the repo when 0).
+    github_app_id: str = ""
+    github_app_private_key_path: str = ""
+    github_app_installation_id: int = 0
+    # Fallback only. A PAT acts as you, so it inherits your admin bypass on main.
     github_token: str = ""
     github_owner: str = ""
     github_repo: str = ""

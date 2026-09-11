@@ -9,3 +9,5 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 demo/raw/
+.fuse_hidden*
+*.pem
