@@ -94,6 +94,7 @@ def test_a_lazy_first_answer_still_gets_a_second_chance(llm, repo, tmp_path):
     _, _, out = _run(tmp_path, repo)
     assert out["__interrupt__"], "a real change on attempt 2 reaches the gate"
     assert not out.get("no_change_reason")
+    assert out["rewrite_attempt"] == 2, "METRICS needs to know which attempt won"
 
 
 def test_unchanged_then_broken_is_an_error_not_no_change(llm, repo, tmp_path):

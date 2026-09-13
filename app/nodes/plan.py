@@ -91,7 +91,7 @@ def plan_node(state: AgentState) -> dict:
         # of resumed. Planning against "" yields a no-op rewrite and an
         # "Empty diff" three nodes later, which is a miserable thing to debug.
         return {"error": "Empty task. To continue an existing thread use "
-                         "`python -m app.cli resume --thread <id>`."}
+                         "`python -m app.cli resume <id>`."}
 
     try:
         repo = _repo_root(state)

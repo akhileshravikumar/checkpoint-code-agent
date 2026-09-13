@@ -39,6 +39,10 @@ class AgentState(TypedDict, total=False):
     # Set by propose_diff when a fresh task needs no change (the model returned
     # the file unchanged twice). Ends the run without an error or a gate.
     no_change_reason: str
+    # Seconds between the gate opening and the human's decision (last gate).
+    human_pause_s: float | None
+    # Which propose_diff attempt produced the diff (1 = first try). For METRICS.
+    rewrite_attempt: int
 
 def new_task(task: str, repo_path: str) -> AgentState:
     """The input for STARTING a task. Never for resuming one (ADR-005).
@@ -69,4 +73,6 @@ def new_task(task: str, repo_path: str) -> AgentState:
         "retry_count": 0,
         "error": "",
         "no_change_reason": "",
+        "human_pause_s": None,
+        "rewrite_attempt": 0,
     }
