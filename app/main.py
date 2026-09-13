@@ -1,6 +1,7 @@
 """FastAPI app: WebSocket endpoint plus the static dashboard."""
 import asyncio
 import subprocess
+import time
 import threading
 import uuid
 from contextlib import asynccontextmanager
@@ -140,7 +141,8 @@ def thread_state(thread_id: str):
         "values": {
             k: v for k, v in snap.values.items()
             if k in {"task", "approval_status", "branch", "pr_url",
-                     "ci_status", "retry_count", "error", "no_change_reason"}
+                     "ci_status", "retry_count", "error", "no_change_reason",
+                     "human_pause_s", "rewrite_attempt"}
         },
     }
 
@@ -263,6 +265,15 @@ def _run_until_pause(graph, payload, config, thread_id: str) -> None:
         })
 
 
+def human_pause(snap) -> float | None:
+    """Seconds since the pending gate opened, from its checkpointed payload.
+
+    Survives a server restart: opened_at lives in the checkpoint, not in memory.
+    """
+    opened = snap.interrupts[0].value.get("opened_at") if snap.interrupts else None
+    return round(time.time() - opened, 1) if opened else None
+
+
 def _stopped_mid_node(snap) -> str:
     return (f"This thread stopped inside {', '.join(snap.next)}. "
             "Retry that step, or open a new session.")
@@ -353,10 +364,17 @@ async def ws(websocket: WebSocket):
                     bus.publish(thread_id, _error(_BUSY, refused=True))
                     continue
                 bus.publish(thread_id, {"type": "status", "message": f"{msg['decision']}..."})
+                pause = human_pause(snap)
                 cmd = Command(resume={
-                    "decision": msg["decision"], "note": msg.get("note", "")
+                    "decision": msg["decision"], "note": msg.get("note", ""),
+                    "human_pause_s": pause,
                 })
-                _spawn(_run_until_pause, graph, cmd, config, thread_id)
+                # Each resume is its own LangSmith trace (grouped with the rest of
+                # the thread by its thread_id metadata). The pause sits between
+                # traces, not inside a span, so it is attached here explicitly.
+                traced = {**config, "metadata": {"human_pause_s": pause,
+                                                 "decision": msg["decision"]}}
+                _spawn(_run_until_pause, graph, cmd, traced, thread_id)
     except WebSocketDisconnect:
         pass
     finally:

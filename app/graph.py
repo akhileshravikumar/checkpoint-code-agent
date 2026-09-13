@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from pathlib import Path
 
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -27,18 +28,24 @@ def await_approval_node(state: AgentState) -> dict:
     decision = interrupt({
         "type": "diff_proposed",
         "diff": state["diff"],
-        "plan": state["plan"],          # already a dict — see app/state.py
+        "plan": state["plan"],
         "commit_message": state["commit_message"],
         "stats": diff_stats(state["diff"]),
         "retry_count": state.get("retry_count", 0),
         "retry_reason": ("ci" if state.get("ci_failure_log")
                  else "edit" if state.get("edit_note") else None),
+        # When the gate opened. The checkpointed payload keeps the FIRST value:
+        # on resume this node re-runs and builds a new payload, but interrupt()
+        # returns the decision instead of storing it.
+        "opened_at": time.time(),
     })
     if isinstance(decision, str):
         decision = {"decision": decision}
     return {
         "approval_status": decision.get("decision", "rejected"),
         "edit_note": decision.get("note", ""),
+        # Measured by whoever resumed the gate, from the checkpointed opened_at.
+        "human_pause_s": decision.get("human_pause_s"),
     }
 
 

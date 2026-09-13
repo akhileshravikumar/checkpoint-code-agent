@@ -244,6 +244,7 @@ def propose_diff_node(state: AgentState) -> dict:
             "new_content": new_content,
             "commit_message": _commit_message(plan),
             "approval_status": "pending",
+            "rewrite_attempt": attempt + 1,
             "error": "",
         }
 

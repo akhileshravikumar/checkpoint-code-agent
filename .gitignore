@@ -1,4 +1,5 @@
-docs/
+docs/*
+!docs/github-app-setup.md
 .venv/
 __pycache__/
 *.py[cod]

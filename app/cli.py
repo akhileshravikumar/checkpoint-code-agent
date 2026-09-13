@@ -1,4 +1,5 @@
 """Terminal harness for the graph. No web server involved."""
+import time
 import uuid
 
 import typer
@@ -39,8 +40,12 @@ def _drive(graph, config, first) -> dict:
     """Run the approval loop until the graph stops interrupting."""
     result = first
     while interrupts := result.get("__interrupt__"):
-        _show(interrupts[0].value)
-        result = graph.invoke(Command(resume=_ask()), config=config)
+        payload = interrupts[0].value
+        _show(payload)
+        decision = _ask()
+        if opened := payload.get("opened_at"):
+            decision["human_pause_s"] = round(time.time() - opened, 1)
+        result = graph.invoke(Command(resume=decision), config=config)
     return result
 
 
@@ -71,7 +76,7 @@ def run(task: str, repo: str = ".", thread: str = ""):
         console.print(
             f"[red]Thread {thread_id} is already in progress "
             f"(paused before: {', '.join(snap.next)}).[/red]\n"
-            f"[dim]Continue it with: python -m app.cli resume --thread {thread_id}[/dim]"
+            f"[dim]Continue it with: python -m app.cli resume {thread_id}[/dim]"
         )
         raise typer.Exit(1)
 
@@ -105,8 +110,12 @@ def resume(thread: str):
     console.print(f"[dim]next node: {', '.join(snap.next)}[/dim]")
 
     if snap.interrupts:
-        _show(snap.interrupts[0].value)
-        result = graph.invoke(Command(resume=_ask()), config=config)
+        payload = snap.interrupts[0].value
+        _show(payload)
+        decision = _ask()
+        if opened := payload.get("opened_at"):
+            decision["human_pause_s"] = round(time.time() - opened, 1)
+        result = graph.invoke(Command(resume=decision), config=config)
     else:
         # Paused without an interrupt (crash mid-node). None re-runs the
         # pending task from its checkpointed input.
