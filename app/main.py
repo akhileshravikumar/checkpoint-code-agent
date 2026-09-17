@@ -1,6 +1,7 @@
 """FastAPI app: WebSocket endpoint plus the static dashboard."""
 import asyncio
 import subprocess
+import sys
 import time
 import threading
 import uuid
@@ -21,6 +22,30 @@ from app.state import new_task
 from app.tracing import configure_tracing
 
 DASHBOARD = Path(__file__).parent.parent / "dashboard" / "index.html"
+
+
+def reload_watch_warning(argv: list[str], cwd: Path, workspace: Path) -> str | None:
+    """`--reload` plus a workspace inside the watched tree restarts mid-run.
+
+    The agent's whole job is writing .py files into .workspace/. uvicorn's
+    reloader includes `*.py` and excludes only names starting with a dot, which
+    a dotted *directory* does not satisfy (`Path(".workspace/x.py").match(".*")`
+    is False). So `execute` applying its own patch restarts the server, the
+    dashboard socket closes mid-run and the thread is left parked in a node —
+    durable, resumable, and baffling if you don't know why it happened.
+    """
+    if not any(a == "--reload" or a.startswith("--reload=") for a in argv):
+        return None
+    try:
+        rel = workspace.expanduser().resolve().relative_to(cwd.resolve())
+    except ValueError:
+        return None                      # workspace lives outside the watched tree
+    return (
+        f"--reload is watching {rel}/, which is where the agent writes the code it "
+        f"patches. Approving a diff will restart the server and drop the dashboard "
+        f"socket mid-run. Start it without --reload, or add: "
+        f"--reload-exclude '{rel}/*'"
+    )
 
 
 def _check_ollama() -> None:
@@ -46,6 +71,8 @@ async def lifespan(app: FastAPI):
     app.state.graph = build_graph(make_checkpointer())
     s = get_settings()
     app.state.workspace = str(s.workspace_dir.expanduser().resolve())
+    if warning := reload_watch_warning(sys.argv, Path.cwd(), s.workspace_dir):
+        print(f"[startup] WARNING: {warning}")
     if not s.checkpoint_offline:
         try:
             gh = GitHubClient()

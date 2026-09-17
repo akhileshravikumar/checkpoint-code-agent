@@ -12,6 +12,8 @@ class Settings(BaseSettings):
     # Local inference
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen2.5-coder:3b"
+    # Used only for retries (see app.llm.retry_model). Empty = same model.
+    ollama_model_retry: str = ""
 
     # A full-file rewrite (ADR-001) carries the target file TWICE through the
     # context: once as source in the prompt, once as `new_content` in the reply.

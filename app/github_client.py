@@ -30,6 +30,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from app import ci_log
  
 import httpx
 from github import Auth, Github, GithubException, GithubIntegration
@@ -410,7 +411,9 @@ class GitHubClient:
         return runs[0] if runs else None
  
     def failure_log(self, run_id: int, max_chars: int = 4000) -> str:
-        """Fetch the log of the first failed job, tail-truncated for the prompt."""
+        """The first failed job's log, cut down to the failing step's output.
+
+        The raw tail is post-job cleanup, not test output; see app/ci_log.py."""
         jobs_r = self._http.get(
             f"/repos/{self.s.repo_slug}/actions/runs/{run_id}/jobs"
         )
@@ -431,7 +434,7 @@ class GitHubClient:
         )
         if r.status_code != 200:
             return ""
-        return r.text[-max_chars:]
+        return ci_log.focus(r.text, max_chars)
  
     def close(self) -> None:
         self._http.close()

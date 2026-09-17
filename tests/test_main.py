@@ -8,6 +8,7 @@ GitHub clone — does not run; the graph is installed by hand.
 import queue
 import sqlite3
 import threading
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -280,3 +281,40 @@ def test_files_names_the_workspace_branch(client, tmp_path):
     import subprocess
     subprocess.run(["git", "init", "-q", "-b", "main", str(tmp_path)], check=True)
     assert client[0].get("/files").json()["branch"] == "main", "even before the first commit"
+
+
+# --- the reloader restarting the server mid-run (W3D3, live) -----------------
+
+
+def test_reload_plus_an_in_repo_workspace_is_flagged(tmp_path):
+    from app.main import reload_watch_warning
+
+    w = reload_watch_warning(["uvicorn", "app.main:app", "--reload"],
+                             tmp_path, tmp_path / ".workspace")
+    assert w and "--reload-exclude '.workspace/*'" in w
+
+
+def test_no_warning_without_reload(tmp_path):
+    from app.main import reload_watch_warning
+
+    assert reload_watch_warning(["uvicorn", "app.main:app"],
+                                tmp_path, tmp_path / ".workspace") is None
+
+
+def test_no_warning_when_the_workspace_is_outside_the_watched_tree(tmp_path):
+    from app.main import reload_watch_warning
+
+    assert reload_watch_warning(["uvicorn", "--reload"], tmp_path,
+                                tmp_path.parent / "elsewhere" / "ws") is None
+
+
+def test_uvicorns_own_filter_does_not_save_us():
+    """Why the warning exists: a dotted directory is not a dotted filename."""
+    p = Path("/repo/.workspace/sandbox/search.py")
+    assert p.match("*.py") and not p.match(".*"), "uvicorn reloads on this path"
+
+
+def test_the_dashboard_waits_for_the_server_and_reloads():
+    html = (Path(__file__).parent.parent / "dashboard" / "index.html").read_text()
+    assert "reconnecting…" in html
+    assert "location.reload()" in html

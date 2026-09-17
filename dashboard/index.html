@@ -135,7 +135,29 @@ const renderDiff = text => {
 };
 
 ws.onopen = () => log('connected');
-ws.onclose = () => { $('state').textContent = 'disconnected'; log('connection closed'); };
+// The server can go away mid-run (a crash, or --reload noticing the agent's
+// own patch). Every bit of state is in the checkpointer, and a fresh load
+// rebuilds the view from it, so wait for the server and reload rather than
+// leaving a dead page that says "disconnected".
+let reconnectPoll = null;
+ws.onclose = () => {
+  $('state').textContent = 'reconnecting…';
+  log('connection closed — waiting for the server');
+  if (reconnectPoll) return;
+  const until = Date.now() + 120000;
+  reconnectPoll = setInterval(async () => {
+    if (Date.now() > until) {
+      clearInterval(reconnectPoll); reconnectPoll = null;
+      $('state').textContent = 'disconnected';
+      log('server did not come back — restart it, then reload this page');
+      return;
+    }
+    try {
+      const r = await fetch('health', { cache: 'no-store' });
+      if (r.ok) { clearInterval(reconnectPoll); location.reload(); }
+    } catch (e) { /* still down; keep waiting */ }
+  }, 1000);
+};
 
 const showRetry = on => { $('retry').hidden = !on; };
 

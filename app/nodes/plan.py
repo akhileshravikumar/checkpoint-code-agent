@@ -1,8 +1,10 @@
 """plan node: task + source -> ChangePlan."""
+import re
 from pathlib import Path
 
+from app import ci_log
 from app.config import get_settings
-from app.llm import get_llm
+from app.llm import get_llm, retry_model
 from app.prompts import PLAN_SYSTEM, PLAN_USER
 from app.schemas import ChangePlan
 from app.state import AgentState
@@ -19,6 +21,11 @@ from app.state import AgentState
 _SKIP_DIRS = {".git", ".venv", "venv", "env", "__pycache__", "node_modules",
               ".tox", ".mypy_cache", ".pytest_cache", "build", "dist", ".workspace",
               "tests", "test", "demo", ".github"}
+
+
+# Anything that looks like an exception class, for spotting a step that names
+# the wrong one ("raise a ValueError if it is None" when the test wants TypeError).
+_EXC = re.compile(r"\b([A-Z][A-Za-z0-9]*(?:Error|Exception))\b")
 
 
 class PlanError(RuntimeError):
@@ -83,6 +90,38 @@ def _resolve_target(state: AgentState, repo: Path) -> Path:
     )
 
 
+def _pin_required_exceptions(plan: ChangePlan, repo: Path, log: str) -> None:
+    """Add the exception type the tests demand as a step, in Python.
+
+    Live evidence (three attempts, one thread): told the failing test, shown its
+    source, and told outright that TypeError was required, the 3B model still
+    planned "raise a ValueError if it is None" every time — and the rewrite
+    follows the plan. The requirement is mechanical, so it is written here
+    instead of asked for, the same bargain as ADR-001.
+    """
+    if not log:
+        return
+    required = ci_log.required_exceptions(repo, log)
+    if not required:
+        return
+
+    # Once Python knows every exception the tests demand, the model's own words
+    # about exception types are only a chance to contradict them — including
+    # "change the raise to ValueError", which is how the loop started flipping
+    # one guard back and forth. Drop them all and state the contract instead.
+    kept = [st for st in plan.steps if not _EXC.search(st)]
+    pinned = [
+        f"Raise {exc} — not any other exception type — when called as "
+        f"`{call}` ({test})." if call else
+        f"Raise {exc} — not any other exception type — as {test} requires."
+        for test, exc, call in required
+    ]
+    if len({exc for _t, exc, _c in required}) > 1:
+        pinned.append("Use a separate check per required exception: one combined "
+                      "condition cannot raise two different types.")
+    plan.steps = (pinned + kept)[:5]
+
+
 def plan_node(state: AgentState) -> dict:
     s = get_settings()
 
@@ -110,8 +149,15 @@ def plan_node(state: AgentState) -> dict:
         extra = f"\nThe reviewer rejected the previous attempt with this note:\n{note}\n"
     if log := state.get("ci_failure_log"):
         extra += f"\nThe previous change failed CI. Failing output:\n```\n{log[-2000:]}\n```\n"
+        # Without this the plan says "validate the input" and the rewrite obeys
+        # the plan, not the test: three attempts in a row raised ValueError for
+        # a test that requires TypeError.
+        if musts := ci_log.expectations(repo, log):
+            extra += (f"\nRequired behaviour — the plan must say exactly this, "
+                      f"naming the same exception type:\n{musts}\n")
 
-    llm = get_llm(num_predict=s.ollama_num_predict).with_structured_output(
+    model = retry_model() if _is_replan(state) else None
+    llm = get_llm(num_predict=s.ollama_num_predict, model=model).with_structured_output(
         ChangePlan, method="json_schema"
     )
     plan: ChangePlan = llm.invoke([
@@ -124,5 +170,6 @@ def plan_node(state: AgentState) -> dict:
         )),
     ])
     plan.target_file = str(target.relative_to(repo))  # trust our resolution, not the model's
+    _pin_required_exceptions(plan, repo, state.get("ci_failure_log", ""))
     # Stored as a dict, not a Pydantic object: see app/state.py.
     return {"plan": plan.model_dump(), "repo_path": str(repo), "error": ""}

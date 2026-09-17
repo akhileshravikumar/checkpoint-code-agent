@@ -31,9 +31,10 @@ from app.diffing import (
     extract_file_body,
     validate_patch,
 )
-from app.llm import get_llm
+from app.llm import get_llm, retry_model
 from app.schemas import ChangePlan
 from app.state import AgentState
+from app import ci_log
 
 DIFF_SYSTEM = """You rewrite a single Python file to implement an approved plan.
 
@@ -51,7 +52,7 @@ Rules:
 * Keep the existing indentation style.
 * Make the smallest change that satisfies the plan."""
 
-DIFF_USER = """Plan: {summary}
+DIFF_USER = """{context}Plan: {summary}
 
 Steps:
 {steps}
@@ -96,6 +97,15 @@ _RETRY_HINTS = {
         "plan steps and check each one against the code. If a step is not yet "
         "implemented, apply it and return the whole file. If the file already "
         "satisfies every step, return it unchanged again."
+    ),# A retry is different: the current file is exactly what CI (or the
+    # reviewer) rejected, so "unchanged" is known to be wrong. Point at the
+    # evidence instead of inviting a second no-op.
+    "empty_retry": (
+        "Your previous answer was identical to the current file, but the "
+        "current file is the version that was rejected. Read the failing test "
+        "output or reviewer note above, find the exact expectation (which "
+        "input, which exception or return value), implement it, and return "
+        "the whole file."
     ),
     "dropped": (
         "Your previous answer was NOT the complete file — it replaced the module "
@@ -116,6 +126,30 @@ _RETRY_HINTS = {
     ),
 }
 
+def _retry_context(state: AgentState) -> str:
+    """Why this is a retry, for the rewrite prompt.
+
+    plan already sees the CI log and the edit note, but a 3B model compresses
+    them into a step like "add input validation", which the file already
+    appears to do. The rewrite then comes back unchanged twice and the retry
+    dies as "no change". The concrete failing assertion has to reach the node
+    that writes the code.
+    """
+    parts = []
+    if note := (state.get("edit_note") or "").strip():
+        parts.append(f"The reviewer rejected the previous version with this note:\n{note}")
+    if log := state.get("ci_failure_log"):
+        parts.append(
+            "The current file FAILED CI. The rewrite must make these tests pass:\n"
+            f"```\n{ci_log.digest(log)}\n```"
+        )
+        repo = Path(state["repo_path"])
+        if tests := ci_log.failing_tests(repo, log):
+            parts.append(f"The failing tests, as written:\n```python\n{tests}\n```")
+        # Spelled out, because the model reads pytest.raises(X) as decoration.
+        if musts := ci_log.expectations(repo, log):
+            parts.append(f"Required behaviour:\n{musts}")
+    return "\n\n".join(parts) + "\n\n" if parts else ""
 
 def _classify(exc: Exception) -> str:
     if isinstance(exc, RewriteError):
@@ -176,6 +210,8 @@ def propose_diff_node(state: AgentState) -> dict:
     target = repo / plan.target_file
     before = target.read_text(encoding="utf-8")
 
+    context = _retry_context(state)
+
     prompt = [
         ("system", DIFF_SYSTEM),
         (
@@ -188,6 +224,7 @@ def propose_diff_node(state: AgentState) -> dict:
                 path=plan.target_file,
                 source=before,
                 line_count=before.strip().count(chr(10)) + 1,
+                context=context,
             ),
         ),
     ]
@@ -203,11 +240,13 @@ def propose_diff_node(state: AgentState) -> dict:
             num_predict=s.ollama_num_predict_rewrite,
             temperature=s.ollama_temperature if attempt == 0 else 0.4,
             streaming=True,
+            model=retry_model() if state.get("retry_count", 0) else None,
         )
 
         messages = list(prompt)
         if kind:
-            messages.append(("user", _RETRY_HINTS[kind] + f"\n\n(Error: {last_error})"))
+            hint = "empty_retry" if kind == "empty" and context else kind
+            messages.append(("user", _RETRY_HINTS[hint] + f"\n\n(Error: {last_error})"))
 
         try:
             resp = _generate(llm, messages, attempt + 1)
