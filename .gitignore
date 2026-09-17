@@ -12,3 +12,5 @@ __pycache__/
 demo/raw/
 .fuse_hidden*
 *.pem
+metrics
+tests/fixtures/*
